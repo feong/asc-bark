@@ -1,0 +1,9 @@
+Date	App Name	App Apple Identifier	Download Type	App Version	Device	Platform Version	Source Type	Page Type	Pre-Order	Territory	Counts
+2024-03-30	Sample	1000000001	First-time Download	1.0	iPhone	17.4	App Store search	Product page	false	US	10
+2024-03-30	Sample	1000000001	First-time Download	1.0	iPhone	17.4	App Store browse	Product page	false	CN	2
+2024-03-30	Sample	1000000001	Redownload	1.0	iPad	17.4	App Store search	Product page	false	US	3
+2024-03-30	Sample	1000000001	Manual update	1.0	iPhone	17.4	App Store search	Product page	false	US	100
+2024-03-30	Sample	1000000001	Auto-update	1.0	iPhone	17.4	Unavailable	No Page	false	US	50
+2024-03-30	Sample	1000000001	Restore	1.0	iPhone	17.4	Unavailable	No Page	false	US	7
+2024-03-30	Other	1000000002	First-time Download	1.0	iPhone	17.4	App Store search	Product page	false	US	999
+2024-03-31	Sample	1000000001	First-time Download	1.0	iPhone	17.4	App Store search	Product page	false	US	1

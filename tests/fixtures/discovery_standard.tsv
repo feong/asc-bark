@@ -1,0 +1,9 @@
+Date	App Name	App Apple Identifier	Event	Page Type	Source Type	Engagement Type	Device	Platform Version	Territory	Counts	Unique Counts
+2024-03-30	Sample	1000000001	Impression	No page	App Store search		iPhone	17.4	US	20	4
+2024-03-30	Sample	1000000001	Impression	No page	App Store browse		iPhone	17.4	CN	5	4
+2024-03-30	Sample	1000000001	Page view	Product page	App Store search		iPhone	17.4	US	8	3
+2024-03-30	Sample	1000000001	Page view	Product page	App Store browse		iPad	17.4	JP	1	1
+2024-03-30	Sample	1000000001	Page view	Store sheet	App referrer		iPhone	17.4	US	30	9
+2024-03-30	Sample	1000000001	Tap	Product page	App Store search	Get	iPhone	17.4	US	6	2
+2024-03-30	Other	1000000002	Impression	No page	App Store search		iPhone	17.4	US	1000	100
+2024-03-29	Sample	1000000001	Impression	No page	App Store search		iPhone	17.4	US	3	1

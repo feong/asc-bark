@@ -1,0 +1,10 @@
+.git
+.venv
+.env
+secrets
+data
+tests
+__pycache__
+*.pyc
+*.md
+LICENSE

@@ -1,0 +1,14 @@
+services:
+  asc-bark:
+    build: .
+    image: asc-bark:local
+    user: "10001:10001"
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      ASC_DATA_DIR: /data
+      ASC_PRIVATE_KEY_PATH: /secrets/AuthKey.p8
+    volumes:
+      - ./data:/data
+      - ./secrets/AuthKey.p8:/secrets/AuthKey.p8:ro
