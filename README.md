@@ -121,7 +121,7 @@ python3 asc_bark.py serve
 
 ## Docker
 
-镜像可以在本地构建，也可以拉取已发布的 `ghcr.io/feong/asc-bark`。容器以 uid `10001` 运行，不监听端口，不挂载 Docker socket。私钥卷是只读的。`.env` 和 p8 不会被复制进镜像。默认命令是 `serve`，重启策略是 `unless-stopped`。`docker stop` 的宽限时间是 5 分钟，用来等正在进行的那一轮抓取结束；如果当时只是在等下一个日程，进程会在大约一秒内退出。
+镜像可以在本地构建，也可以拉取已发布的 `ghcr.io/feong/asc-bark`。已发布标签是一份多架构清单，包含 `linux/amd64` 和 `linux/arm64/v8`：`docker pull` 会按当前机器选择其中一份，不需要另写平台或另选标签。本地 `docker compose build` 只构建当前机器的架构。容器以 uid `10001` 运行，不监听端口，不挂载 Docker socket。私钥卷是只读的。`.env` 和 p8 不会被复制进镜像。默认命令是 `serve`，重启策略是 `unless-stopped`。`docker stop` 的宽限时间是 5 分钟，用来等正在进行的那一轮抓取结束；如果当时只是在等下一个日程，进程会在大约一秒内退出。
 
 ```bash
 cp .env.example .env
@@ -163,7 +163,7 @@ docker compose run --rm asc-bark test-notification
 
 ## 已发布镜像
 
-推送到 `main` 时，GitHub Actions 构建镜像并发布 `ghcr.io/feong/asc-bark:latest`。推送以 `v` 开头的版本标签（例如 `v1.2.3`）时，再发布同名标签，不会改写 `latest`。工作流只用仓库自带的 `GITHUB_TOKEN`，不需要另外的注册表密钥。仓库是公开的时候，发布之后会把这个包设为公开，拉取不需要登录。
+推送到 `main` 时，GitHub Actions 用 Buildx 同时构建 `linux/amd64` 和 `linux/arm64/v8`，并发布成同一个 `ghcr.io/feong/asc-bark:latest` 清单。推送以 `v` 开头的版本标签（例如 `v1.2.3`）时，再发布同名标签，同样是这两份架构，不会改写 `latest`。拉取请求只构建这两份架构，不推送到仓库。工作流只用仓库自带的 `GITHUB_TOKEN`，不需要另外的注册表密钥。仓库是公开的时候，发布之后会把这个包设为公开，拉取不需要登录。
 
 ```bash
 docker pull ghcr.io/feong/asc-bark:latest

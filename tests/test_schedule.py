@@ -483,6 +483,13 @@ class DeployContractTests(unittest.TestCase):
         self.assertIn("type=ref,event=tag", workflow)
         self.assertIn('- "v*"', workflow)
         self.assertIn("visibility == 'public'", workflow)
+        self.assertIn("PLATFORMS: linux/amd64,linux/arm64/v8", workflow)
+        self.assertEqual(workflow.count("platforms: ${{ env.PLATFORMS }}"), 2)
+        self.assertIn("docker/setup-qemu-action@v4.4.0", workflow)
+        self.assertIn("outputs: type=oci,dest=/tmp/asc-bark-image.tar", workflow)
+        self.assertIn('{"os": "linux", "architecture": "arm64", "variant": "v8"}', workflow)
+        self.assertIn("linux/amd64", readme)
+        self.assertIn("linux/arm64/v8", readme)
 
 
 class ShutdownSignalTests(unittest.TestCase):
