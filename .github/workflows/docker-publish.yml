@@ -187,32 +187,118 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Make the package public
+      # GITHUB_TOKEN cannot change package visibility. The Packages API
+      # does not enable that operation for GitHub Actions. Confirm the tag
+      # can be pulled without credentials and contains both platforms.
+      - name: Check the published tag is public
         if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          set -euo pipefail
-          package="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
-          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          try_public() {
-            gh api --method PATCH \
-              -H "Accept: application/vnd.github+json" \
-              "$1" \
-              -f visibility=public >/dev/null
-          }
-          for attempt in 1 2 3 4 5 6; do
-            if try_public "/user/packages/container/${package}/visibility" \
-              || try_public "/user/packages/container/${package}" \
-              || try_public "/users/${owner}/packages/container/${package}/visibility" \
-              || try_public "/users/${owner}/packages/container/${package}" \
-              || try_public "/orgs/${owner}/packages/container/${package}/visibility" \
-              || try_public "/orgs/${owner}/packages/container/${package}"; then
-              echo "ghcr.io/${owner}/${package} is public."
-              exit 0
-            fi
-            echo "Package visibility is not ready yet (attempt ${attempt})."
-            sleep 5
-          done
-          echo "Could not set ghcr.io/${owner}/${package} to public with GITHUB_TOKEN."
-          exit 1
+          python3 - << 'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          tags = [line.strip() for line in os.environ["TAGS"].splitlines() if line.strip()]
+          if not tags:
+              print("no tags were published", file=sys.stderr)
+              sys.exit(1)
+
+          def normalize(item):
+              # Buildx omits the default arm64 variant. An empty variant is v8.
+              variant = item["variant"]
+              if item["architecture"] == "arm64" and variant in ("", "v8"):
+                  variant = "v8"
+              return {
+                  "os": item["os"],
+                  "architecture": item["architecture"],
+                  "variant": variant,
+              }
+
+          required = [
+              {"os": "linux", "architecture": "amd64", "variant": ""},
+              {"os": "linux", "architecture": "arm64", "variant": "v8"},
+          ]
+
+          def request(url, headers):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return response.read()
+
+          def platforms_for(tag):
+              host, rest = tag.split("/", 1)
+              name, version = rest.rsplit(":", 1)
+              scope = urllib.parse.quote(f"repository:{name}:pull", safe="")
+              token = json.loads(
+                  request(f"https://{host}/token?service={host}&scope={scope}", {})
+              )["token"]
+              body = request(
+                  f"https://{host}/v2/{name}/manifests/{version}",
+                  {
+                      "Authorization": f"Bearer {token}",
+                      "Accept": ", ".join(
+                          [
+                              "application/vnd.oci.image.index.v1+json",
+                              "application/vnd.docker.distribution.manifest.list.v2+json",
+                          ]
+                      ),
+                  },
+              )
+              found = []
+              for item in json.loads(body).get("manifests") or []:
+                  platform = item.get("platform") or {}
+                  os_name = platform.get("os") or ""
+                  architecture = platform.get("architecture") or ""
+                  if os_name in ("", "unknown") or architecture in ("", "unknown"):
+                      continue
+                  found.append(
+                      normalize(
+                          {
+                              "os": os_name,
+                              "architecture": architecture,
+                              "variant": platform.get("variant") or "",
+                          }
+                      )
+                  )
+              return name, found
+
+          for tag in tags:
+              name = tag.split("/", 1)[1].rsplit(":", 1)[0]
+              for attempt in range(1, 7):
+                  try:
+                      _name, found = platforms_for(tag)
+                      missing = [item for item in required if item not in found]
+                      print(json.dumps(found, indent=2))
+                      if missing:
+                          print("missing platforms:", json.dumps(missing), file=sys.stderr)
+                          sys.exit(1)
+                      print(tag, "is public")
+                      break
+                  except urllib.error.HTTPError as exc:
+                      print(
+                          f"{tag} is not anonymously pullable yet (attempt {attempt}): HTTP {exc.code}",
+                          file=sys.stderr,
+                      )
+                      if attempt == 6:
+                          owner, package = name.split("/", 1)
+                          print(
+                              "Set the package public once at "
+                              f"https://github.com/users/{owner}/packages/container/package/{package}/settings",
+                              file=sys.stderr,
+                          )
+                          sys.exit(1)
+                      time.sleep(5)
+                  except urllib.error.URLError as exc:
+                      print(
+                          f"{tag} could not be fetched (attempt {attempt}): {exc.reason}",
+                          file=sys.stderr,
+                      )
+                      if attempt == 6:
+                          sys.exit(1)
+                      time.sleep(5)
+          PY
