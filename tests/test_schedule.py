@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import signal
 import subprocess
@@ -237,6 +238,35 @@ class NextOccurrenceTests(unittest.TestCase):
         self.assertEqual((nxt_minute.hour, nxt_minute.minute, nxt_minute.fold), (1, 31, 0))
         self.assertEqual(nxt_minute.utcoffset(), timedelta(hours=-4))
 
+    def test_immediate_cycle_runs_once_before_the_first_wait(self):
+        moment = datetime(2026, 11, 1, 1, 30, tzinfo=NEW_YORK, fold=0)
+        runs = []
+        triggers = []
+        delays = []
+
+        def wait(delay: float) -> bool:
+            delays.append(delay)
+            return True
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = asc_bark.serve_loop(
+                asc_bark.parse_schedule("30 1 * * *"),
+                NEW_YORK,
+                lambda: runs.append("ran") or asc_bark.Result(0, "已推送。"),
+                clock=lambda: moment,
+                wait=wait,
+                run_immediately=True,
+                before_run=triggers.append,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(runs, ["ran"])
+        self.assertEqual(triggers, ["startup"])
+        self.assertEqual(len(delays), 1)
+        self.assertAlmostEqual(delays[0], 3600, delta=1)
+        self.assertIn("已推送。", output.getvalue())
+        self.assertIn("01:30:00-05:00", output.getvalue())
+
     def test_steps_do_not_catch_up_missed_slots(self):
         schedule = asc_bark.parse_schedule("*/15 * * * *")
         now = datetime(2026, 11, 26, 10, 0, 1, tzinfo=SHANGHAI)
@@ -447,6 +477,240 @@ class ServeLoopTests(unittest.TestCase):
                 runner=runner,
             )
         self.assertEqual(caught.exception.code, 2)
+        self.assertFalse((self.data / "serve.json").exists())
+
+    def _config(self) -> asc_bark.Config:
+        return asc_bark.Config(
+            issuer_id="issuer-example-0001",
+            key_id="KEYEXAMPLE1",
+            app_id="1000000001",
+            private_key="x" * 16,
+            key_path="",
+            bark_key="bark-device-key-0001",
+            bark_server="https://bark.test",
+            data_dir=self.data,
+        )
+
+    def _serve(self, runner, wait):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = asc_bark.cmd_serve(
+                self._config(),
+                session=object(),
+                schedule=self.schedule,
+                tz=SHANGHAI,
+                clock=_fixed(self.now),
+                wait=wait,
+                runner=runner,
+            )
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def _record(self) -> dict:
+        return json.loads((self.data / "serve.json").read_text(encoding="utf-8"))
+
+    def test_first_start_runs_once_then_restart_waits(self):
+        runs = []
+        delays = []
+
+        def runner():
+            record = self._record()
+            self.assertEqual(record["runs"], 1)
+            self.assertEqual(record["first_trigger"], "startup")
+            self.assertNotIn("bark-device-key-0001", json.dumps(record))
+            runs.append("startup")
+            return asc_bark.Result(0, "已推送。")
+
+        def wait(delay: float) -> bool:
+            delays.append(delay)
+            return True
+
+        result, stdout, stderr = self._serve(runner, wait)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.message, "已停止。")
+        self.assertEqual(runs, ["startup"])
+        self.assertEqual(len(delays), 1)
+        self.assertAlmostEqual(delays[0], 3600, delta=1)
+        self.assertIn("还没有 serve 触发过的运行记录", stdout)
+        self.assertIn("先抓取一次", stdout)
+        self.assertIn("2026-11-26T09:00:00+08:00", stdout)
+        self.assertNotIn("不会立刻抓取", stdout)
+        self.assertEqual(stderr, "")
+        self.assertEqual(self._record()["runs"], 1)
+        self.assertEqual(self._record()["first_started_at"], "2026-11-26T08:00:00+08:00")
+        self.assertEqual((self.data / "serve.json").stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.data / "state.json").exists())
+
+        runs.clear()
+        result, stdout, stderr = self._serve(
+            lambda: runs.append("restart") or asc_bark.Result(0, "已推送。"),
+            lambda _delay: True,
+        )
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.message, "已停止。")
+        self.assertEqual(runs, [])
+        self.assertIn("已有 serve 运行记录", stdout)
+        self.assertIn("不会立刻抓取", stdout)
+        self.assertIn("2026-11-26T09:00:00+08:00", stdout)
+        self.assertEqual(self._record()["runs"], 1)
+        self.assertEqual(self._record()["last_trigger"], "startup")
+        self.assertEqual(stderr, "")
+
+        asc_bark.save_state(
+            self.data / "state.json",
+            {"version": asc_bark.STATE_VERSION, "instances": {}, "pushed": {}},
+        )
+        (self.data / "state.json").unlink()
+        runs.clear()
+        result, stdout, stderr = self._serve(
+            lambda: runs.append("state") or asc_bark.Result(0, "已推送。"),
+            lambda _delay: True,
+        )
+        self.assertEqual(runs, [])
+        self.assertIn("不会立刻抓取", stdout)
+        self.assertEqual(self._record()["runs"], 1)
+
+        (self.data / "serve.json").unlink()
+        runs.clear()
+        result, stdout, stderr = self._serve(
+            lambda: runs.append("again") or asc_bark.Result(0, "已推送。"),
+            lambda _delay: True,
+        )
+        self.assertEqual(result.code, 0)
+        self.assertEqual(runs, ["again"])
+        self.assertIn("先抓取一次", stdout)
+        self.assertEqual(self._record()["runs"], 1)
+        self.assertEqual(self._record()["first_trigger"], "startup")
+
+    def test_scheduled_cycle_keeps_the_first_serve_record(self):
+        waits = {"n": 0}
+        runs = []
+
+        def wait(_delay: float) -> bool:
+            waits["n"] += 1
+            return waits["n"] >= 2
+
+        def runner():
+            runs.append(self._record()["last_trigger"])
+            return asc_bark.Result(0, "已推送。")
+
+        result, stdout, _stderr = self._serve(runner, wait)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(runs, ["startup", "schedule"])
+        record = self._record()
+        self.assertEqual(record["runs"], 2)
+        self.assertEqual(record["first_trigger"], "startup")
+        self.assertEqual(record["last_trigger"], "schedule")
+        self.assertEqual(record["first_started_at"], "2026-11-26T08:00:00+08:00")
+        self.assertEqual(record["version"], asc_bark.SERVE_RECORD_VERSION)
+        self.assertEqual(stdout.count("2026-11-26T09:00:00+08:00"), 2)
+
+    def test_failed_startup_cycle_does_not_exit_or_repeat_on_restart(self):
+        calls = {"n": 0}
+
+        def runner():
+            calls["n"] += 1
+            self.assertEqual(self._record()["first_trigger"], "startup")
+            if calls["n"] == 1:
+                raise asc_bark.AscError("Bark 推送失败，未记录为已推送。")
+            return asc_bark.Result(1, "未成功")
+
+        result, stdout, stderr = self._serve(runner, lambda _delay: True)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.message, "已停止。")
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("下次运行：2026-11-26T09:00:00+08:00", stdout)
+        self.assertIn("本次运行失败，将等到下一个日程。", stderr)
+        self.assertIn("Bark 推送失败", stderr)
+        self.assertEqual(self._record()["runs"], 1)
+
+        result, stdout, stderr = self._serve(runner, lambda _delay: True)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("不会立刻抓取", stdout)
+        self.assertNotIn("本次运行失败", stderr)
+        self.assertEqual(self._record()["runs"], 1)
+
+    def test_unsuccessful_startup_result_keeps_waiting(self):
+        def runner():
+            return asc_bark.Result(1, "未成功")
+
+        result, _stdout, stderr = self._serve(runner, lambda _delay: True)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.message, "已停止。")
+        self.assertIn("未成功", stderr)
+        self.assertIn("本次未成功，将等到下一个日程。", stderr)
+        self.assertEqual(self._record()["first_trigger"], "startup")
+
+    def test_one_shot_state_does_not_count_as_a_serve_run(self):
+        asc_bark.save_state(
+            self.data / "state.json",
+            {
+                "version": asc_bark.STATE_VERSION,
+                "instances": {"instance-1": {"report": "downloads"}},
+                "pushed": {"2024-03-30": {"fingerprint": "abc", "pushed_at": "2024-04-01T00:00:00+00:00"}},
+            },
+        )
+        runs = []
+
+        def runner():
+            runs.append("startup")
+            return asc_bark.Result(0, "已推送。")
+
+        result, stdout, _stderr = self._serve(runner, lambda _delay: True)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(runs, ["startup"])
+        self.assertIn("先抓取一次", stdout)
+        self.assertEqual(self._record()["first_trigger"], "startup")
+        state = json.loads((self.data / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["pushed"]["2024-03-30"]["fingerprint"], "abc")
+        self.assertNotIn("serve", state)
+
+    def test_zero_runs_still_starts_immediately(self):
+        (self.data / "serve.json").write_text(
+            json.dumps({"version": asc_bark.SERVE_RECORD_VERSION, "runs": 0}) + "\n",
+            encoding="utf-8",
+        )
+        runs = []
+        result, stdout, _stderr = self._serve(
+            lambda: runs.append("startup") or asc_bark.Result(0, "已推送。"),
+            lambda _delay: True,
+        )
+        self.assertEqual(result.code, 0)
+        self.assertEqual(runs, ["startup"])
+        self.assertIn("先抓取一次", stdout)
+        self.assertEqual(self._record()["runs"], 1)
+        self.assertEqual(self._record()["first_trigger"], "startup")
+
+    def test_unreadable_serve_record_waits_and_is_not_overwritten(self):
+        samples = {
+            "truncated": "{",
+            "unknown-version": json.dumps({"version": 99, "runs": 1}),
+            "boolean-runs": json.dumps({"version": asc_bark.SERVE_RECORD_VERSION, "runs": True}),
+        }
+        for name, payload in samples.items():
+            with self.subTest(name=name):
+                path = self.data / "serve.json"
+                path.write_text(payload, encoding="utf-8")
+                runs = []
+                waits = {"n": 0}
+
+                def wait(_delay: float) -> bool:
+                    waits["n"] += 1
+                    return waits["n"] >= 2
+
+                def runner():
+                    runs.append("schedule")
+                    return asc_bark.Result(0, "已推送。")
+
+                result, stdout, stderr = self._serve(runner, wait)
+                self.assertEqual(result.code, 0)
+                self.assertEqual(runs, ["schedule"])
+                self.assertEqual(path.read_text(encoding="utf-8"), payload)
+                self.assertIn("不立刻抓取", stdout)
+                self.assertNotIn("先抓取一次", stdout)
+                self.assertIn("未覆盖它", stderr)
+                self.assertIn("未能写入 serve 运行记录，本次抓取仍会继续。", stderr)
 
     def test_commands_still_parse(self):
         self.assertEqual(asc_bark.parse_args(["serve"]).command, "serve")
@@ -494,53 +758,77 @@ class DeployContractTests(unittest.TestCase):
         self.assertIn('item["architecture"] == "arm64" and variant in ("", "v8")', workflow)
         self.assertIn("linux/amd64", readme)
         self.assertIn("linux/arm64/v8", readme)
+        self.assertIn("serve.json", readme)
+        self.assertIn("不会因为容器重启又立刻抓一次", readme)
+        self.assertIn("不会写入 `serve.json`", readme)
 
 
 class ShutdownSignalTests(unittest.TestCase):
     def test_sigterm_and_sigint_stop_the_wait(self):
         script = r"""
+import json
+import shutil
 import signal
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import asc_bark
 
-config = asc_bark.Config(
-    issuer_id="issuer-example-0001",
-    key_id="KEYEXAMPLE1",
-    app_id="1000000001",
-    private_key="x" * 16,
-    key_path="",
-    bark_key="bark-device-key-0001",
-    bark_server="https://bark.test",
-    data_dir="/tmp",
-)
-
-def once(sig):
-    runs = []
-
-    def runner():
-        runs.append(sig)
-        return asc_bark.Result(0, "已推送。")
-
-    def poke():
-        time.sleep(0.3)
-        signal.raise_signal(sig)
-
-    threading.Thread(target=poke, daemon=True).start()
-    result = asc_bark.cmd_serve(
-        config,
-        object(),
-        schedule=asc_bark.parse_schedule("00:00"),
-        tz=asc_bark.ZoneInfo("UTC"),
-        runner=runner,
+data = Path(tempfile.mkdtemp())
+try:
+    (data / "serve.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "runs": 1,
+                "first_trigger": "startup",
+                "first_started_at": "2026-11-26T00:00:00+00:00",
+                "last_trigger": "startup",
+                "last_started_at": "2026-11-26T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
     )
-    if result.code != 0 or result.message != "已停止。" or runs:
-        raise SystemExit(f"sig {sig} result={result} runs={runs}")
+    config = asc_bark.Config(
+        issuer_id="issuer-example-0001",
+        key_id="KEYEXAMPLE1",
+        app_id="1000000001",
+        private_key="x" * 16,
+        key_path="",
+        bark_key="bark-device-key-0001",
+        bark_server="https://bark.test",
+        data_dir=data,
+    )
 
-once(signal.SIGTERM)
-once(signal.SIGINT)
-print("stopped")
+    def once(sig):
+        runs = []
+
+        def runner():
+            runs.append(sig)
+            return asc_bark.Result(0, "已推送。")
+
+        def poke():
+            time.sleep(0.3)
+            signal.raise_signal(sig)
+
+        threading.Thread(target=poke, daemon=True).start()
+        result = asc_bark.cmd_serve(
+            config,
+            object(),
+            schedule=asc_bark.parse_schedule("00:00"),
+            tz=asc_bark.ZoneInfo("UTC"),
+            runner=runner,
+        )
+        if result.code != 0 or result.message != "已停止。" or runs:
+            raise SystemExit(f"sig {sig} result={result} runs={runs}")
+
+    once(signal.SIGTERM)
+    once(signal.SIGINT)
+    print("stopped")
+finally:
+    shutil.rmtree(data, ignore_errors=True)
 """
         env = os.environ.copy()
         env["PYTHONPATH"] = str(ROOT)
@@ -555,4 +843,76 @@ print("stopped")
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("stopped", proc.stdout)
+        self.assertIn("下次运行", proc.stdout)
+        self.assertIn("不会立刻抓取", proc.stdout)
+
+    def test_sigterm_during_startup_cycle_finishes_then_exits(self):
+        script = r"""
+import json
+import shutil
+import signal
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import asc_bark
+
+data = Path(tempfile.mkdtemp())
+try:
+    config = asc_bark.Config(
+        issuer_id="issuer-example-0001",
+        key_id="KEYEXAMPLE1",
+        app_id="1000000001",
+        private_key="x" * 16,
+        key_path="",
+        bark_key="bark-device-key-0001",
+        bark_server="https://bark.test",
+        data_dir=data,
+    )
+    runs = []
+    started = threading.Event()
+
+    def runner():
+        runs.append("startup")
+        started.set()
+        time.sleep(2)
+        return asc_bark.Result(0, "已推送。")
+
+    def poke():
+        if not started.wait(5):
+            raise SystemExit("runner did not start")
+        signal.raise_signal(signal.SIGTERM)
+
+    threading.Thread(target=poke, daemon=True).start()
+    result = asc_bark.cmd_serve(
+        config,
+        object(),
+        schedule=asc_bark.parse_schedule("00:00"),
+        tz=asc_bark.ZoneInfo("UTC"),
+        runner=runner,
+    )
+    record = json.loads((data / "serve.json").read_text(encoding="utf-8"))
+    if result.code != 0 or result.message != "已停止。" or runs != ["startup"]:
+        raise SystemExit(f"result={result} runs={runs}")
+    if record["runs"] != 1 or record["first_trigger"] != "startup":
+        raise SystemExit(f"record={record}")
+    print("finished-startup")
+finally:
+    shutil.rmtree(data, ignore_errors=True)
+"""
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(ROOT)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("finished-startup", proc.stdout)
+        self.assertIn("先抓取一次", proc.stdout)
         self.assertIn("下次运行", proc.stdout)
