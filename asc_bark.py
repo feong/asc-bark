@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Send App Store Connect analytics summaries to Bark.
 
-``run`` fetches one summary and exits. ``serve`` stays up. The first time it
-starts in a data directory with no recorded serve cycle, it fetches once
-immediately, then waits for the next time in ``ASC_SCHEDULE``. Later starts
-wait for that time and do not fetch just because the process started. A
-one-shot ``run`` does not record a serve cycle. The schedule is interpreted
-in the ``TZ`` timezone.
+``run`` fetches one summary and exits. It pushes Bark only when that summary
+changed. ``serve`` stays up and sends one Bark status every time the process
+starts. The first time it starts in a data directory with no recorded serve
+cycle, it fetches once immediately and that single status includes the cycle
+result. Later starts wait for the next time in ``ASC_SCHEDULE`` and do not
+fetch just because the process started. Each later cycle sends one Bark
+notice of its result, including a quiet or failed pull. A one-shot ``run``
+does not record a serve cycle. The schedule is interpreted in the ``TZ``
+timezone.
 
 This uses the Analytics Reports API only. It does not call Sales and Trends
 and it does not scrape the App Store Connect website.
@@ -135,9 +138,10 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class AscError(Exception):
-    def __init__(self, message: str, code: int = 1) -> None:
+    def __init__(self, message: str, code: int = 1, *, bark_attempted: bool = False) -> None:
         super().__init__(message)
         self.code = code
+        self.bark_attempted = bark_attempted
 
 
 @dataclass(frozen=True)
@@ -163,6 +167,18 @@ class Config:
 class Result:
     code: int
     message: str
+    # Set when a new summary is ready but this call must not push it itself.
+    pending_summary: tuple[str, str, str, str] | None = None
+
+
+@dataclass(frozen=True)
+class StartupFacts:
+    """Schedule context included in the one Bark notice for a serve start."""
+
+    schedule: str
+    timezone: str
+    next_run: str
+    immediate: bool
 
 
 def canon_name(value: str) -> str:
@@ -734,12 +750,16 @@ def push_bark(
     url = server.rstrip("/") + "/push"
     payload = {"device_key": key, "title": title, "body": body, "group": "asc-bark"}
     headers = {"Content-Type": "application/json; charset=utf-8", "User-Agent": USER_AGENT}
+
+    def failed() -> None:
+        raise AscError("Bark 推送失败，未记录为已推送。", bark_attempted=True)
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             response = session.post(url, json=payload, headers=headers, timeout=TIMEOUT)
         except requests.RequestException:
             if attempt == MAX_ATTEMPTS:
-                raise AscError("Bark 推送失败，未记录为已推送。") from None
+                failed()
             sleeper(backoff_seconds(attempt))
             continue
         if response.status_code == 200:
@@ -749,12 +769,12 @@ def push_bark(
                 data = None
             if isinstance(data, dict) and data.get("code") == 200:
                 return
-            raise AscError("Bark 推送失败，未记录为已推送。")
+            failed()
         if response.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS:
             sleeper(backoff_seconds(attempt, response.headers.get("Retry-After")))
             continue
-        raise AscError("Bark 推送失败，未记录为已推送。")
-    raise AscError("Bark 推送失败，未记录为已推送。")
+        failed()
+    failed()
 
 
 class AppleClient:
@@ -1152,6 +1172,98 @@ def _cache_dates(cached: object, kind: str, checksums: list[str]) -> dict[str, d
     return dates
 
 
+def _status_detail(message: str) -> str:
+    """Drop the data-push wording from a pull result used as a status."""
+
+    text = message.strip()
+    quiet = "本次不推送，也不把缺失的一天补成 0。"
+    if text.endswith(quiet):
+        text = text[: -len(quiet)].rstrip()
+        if text and not text.endswith("。"):
+            text += "。"
+        return (text + "没有把缺失的一天补成 0。").strip()
+    short = "本次不推送。"
+    if text.endswith(short):
+        text = text[: -len(short)].rstrip(" \n，")
+    return text.strip()
+
+
+def _send_bark(
+    config: Config,
+    session: requests.Session,
+    title: str,
+    body: str,
+    sleeper: Callable[[float], None],
+) -> None:
+    if not config.bark_key:
+        raise AscError("缺少 BARK_KEY。", code=2)
+    secrets = config.secret_values()
+    push_bark(
+        session,
+        config.bark_server,
+        config.bark_key,
+        redact(title, secrets),
+        redact(body, secrets),
+        sleeper,
+    )
+
+
+def _startup_text(
+    facts: StartupFacts,
+    *,
+    outcome: str | None = None,
+    failed: bool = False,
+    summary_title: str | None = None,
+    summary_body: str | None = None,
+) -> tuple[str, str]:
+    title = "asc-bark 已启动"
+    if facts.immediate:
+        mode = "本次启动会立刻抓取。"
+    else:
+        mode = "本次启动只等待，不会立刻抓取。"
+    lines = [
+        "进程已启动。",
+        f"日程 {facts.schedule}，时区 {facts.timezone}。",
+        f"下次运行 {facts.next_run}。",
+        mode,
+    ]
+    if facts.immediate and summary_body:
+        lines.append("启动抓取已完成，汇总如下。")
+        if summary_title:
+            lines.append(summary_title)
+        lines.append(summary_body)
+    elif facts.immediate and failed:
+        lines.append("启动抓取没有完成。" + _status_detail(outcome or ""))
+    elif facts.immediate and outcome:
+        lines.append("启动抓取已完成。" + _status_detail(outcome))
+    return title, "\n".join(lines)
+
+
+def _cycle_text(message: str, *, failed: bool) -> tuple[str, str]:
+    detail = _status_detail(message)
+    if failed:
+        return "asc-bark 本轮失败", "本轮已执行，但没有完成。\n" + detail
+    return "asc-bark 本轮结果", "本轮已执行。\n" + detail
+
+
+def _init_success_text(created: bool) -> tuple[str, str]:
+    title = "asc-bark 初始化完成"
+    if created:
+        state = "ONGOING 请求已创建。"
+    else:
+        state = "ONGOING 请求已存在，未重复创建。"
+    return title, state + "第一份报表通常需要 1–2 天。"
+
+
+def _init_failure_text(created: bool, detail: str) -> tuple[str, str]:
+    title = "asc-bark 初始化未完成"
+    if created:
+        lead = "ONGOING 请求已创建，但初始化没有完成。"
+    else:
+        lead = "初始化没有完成。"
+    return title, lead + detail
+
+
 def cmd_init(
     config: Config,
     session: requests.Session,
@@ -1159,6 +1271,55 @@ def cmd_init(
     snapshot: bool,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> Result:
+    if not config.bark_key:
+        raise AscError("缺少 BARK_KEY。", code=2)
+    progress = {"created": False}
+    try:
+        lines = _init_requests(config, session, snapshot=snapshot, sleeper=sleeper, progress=progress)
+    except AscError as exc:
+        _notify_init_failure(config, session, created=progress["created"], exc=exc, sleeper=sleeper)
+        raise
+    title, body = _init_success_text(progress["created"])
+    try:
+        _send_bark(config, session, title, body, sleeper)
+    except AscError:
+        raise AscError(
+            "\n".join(lines) + "\nBark 通知失败。请求仍在，再次执行 init 不会重复创建。"
+        ) from None
+    lines.append("已发送初始化通知。")
+    lines.append(title)
+    lines.append(body)
+    return Result(0, "\n".join(lines))
+
+
+def _notify_init_failure(
+    config: Config,
+    session: requests.Session,
+    *,
+    created: bool,
+    exc: AscError,
+    sleeper: Callable[[float], None],
+) -> None:
+    detail = redact(str(exc), config.secret_values())
+    title, body = _init_failure_text(created, detail)
+    try:
+        _send_bark(config, session, title, body, sleeper)
+    except AscError:
+        if created:
+            extra = "Bark 通知失败。请求仍在，再次执行 init 不会重复创建。"
+        else:
+            extra = "Bark 通知失败。"
+        raise AscError(f"{exc}\n{extra}", code=exc.code) from None
+
+
+def _init_requests(
+    config: Config,
+    session: requests.Session,
+    *,
+    snapshot: bool,
+    sleeper: Callable[[float], None],
+    progress: dict[str, bool],
+) -> list[str]:
     with locked(config.data_dir):
         client = _client(config, session, sleeper)
         existing = client.list_requests()
@@ -1176,6 +1337,7 @@ def cmd_init(
                     raise AscError("创建 ONGOING 请求时发生冲突，但没有找到可用请求。")
                 lines.append(f"ONGOING 请求已存在 {active[0]['id']}，未重复创建。")
             else:
+                progress["created"] = True
                 if stopped:
                     lines.append("已有因长时间未下载而停止的 ONGOING 请求，已另外创建新的请求。")
                 lines.append(f"已创建 ONGOING 请求 {created}。第一份报表通常需要 1–2 天。")
@@ -1205,7 +1367,7 @@ def cmd_init(
         else:
             lines.append("未请求 ONE_TIME_SNAPSHOT。需要历史报表时再执行 init --snapshot。")
         lines.append("run 只读取和下载，不会创建请求。")
-        return Result(0, "\n".join(lines))
+        return lines
 
 
 def _matching_reports(reports: list[dict[str, str]], spec: dict[str, str]) -> list[dict[str, str]]:
@@ -1223,23 +1385,91 @@ def cmd_run(
     *,
     dry_run: bool,
     sleeper: Callable[[float], None] = time.sleep,
+    notice: str = "data",
+    startup: StartupFacts | None = None,
 ) -> Result:
-    with locked(config.data_dir):
-        state_path = config.data_dir / "state.json"
-        state = load_state(state_path)
-        changed = False
+    """Fetch one summary.
+
+    ``notice`` chooses the single Bark message for this call. ``data`` is a
+    one-shot ``run`` and pushes only a changed summary. ``cycle`` is a later
+    scheduled serve cycle and always sends one result. ``startup`` is the
+    immediate serve cycle and folds that result into the one startup status.
+    """
+
+    if notice not in ("data", "cycle", "startup"):
+        raise AscError("无法发送通知。")
+    if notice == "startup" and startup is None:
+        raise AscError("无法发送启动通知。")
+    if notice in ("cycle", "startup") and not dry_run and not config.bark_key:
+        raise AscError("缺少 BARK_KEY。", code=2)
+
+    def fail_notice(exc: AscError) -> None:
+        if notice not in ("cycle", "startup") or dry_run or exc.bark_attempted:
+            return
         try:
-            result = _run_locked(config, session, state, dry_run=dry_run, sleeper=sleeper, mark_changed=lambda: _mark(state))
-            changed = True
-        except AscError:
-            if state.get("_dirty"):
-                state.pop("_dirty", None)
+            if notice == "startup":
+                title, body = _startup_text(startup, outcome=str(exc), failed=True)  # type: ignore[arg-type]
+            else:
+                title, body = _cycle_text(str(exc), failed=True)
+            _send_bark(config, session, title, body, sleeper)
+        except AscError as bark_exc:
+            raise AscError(f"{exc}\n{bark_exc}", code=exc.code, bark_attempted=True) from None
+        exc.bark_attempted = True
+
+    try:
+        with locked(config.data_dir):
+            state_path = config.data_dir / "state.json"
+            state = load_state(state_path)
+            changed = False
+            try:
+                result = _run_locked(
+                    config,
+                    session,
+                    state,
+                    dry_run=dry_run,
+                    sleeper=sleeper,
+                    mark_changed=lambda: _mark(state),
+                    defer_summary=notice != "data" and not dry_run,
+                )
+                if notice in ("cycle", "startup") and not dry_run:
+                    if result.pending_summary:
+                        summary_title, summary_body, fingerprint, day = result.pending_summary
+                        if notice == "startup":
+                            sent_title, sent_body = _startup_text(
+                                startup,  # type: ignore[arg-type]
+                                summary_title=summary_title,
+                                summary_body=summary_body,
+                            )
+                        else:
+                            sent_title, sent_body = summary_title, summary_body
+                        _send_bark(config, session, sent_title, sent_body, sleeper)
+                        state["pushed"][day] = {"fingerprint": fingerprint, "pushed_at": now_iso()}
+                        _mark(state)
+                    elif notice == "startup":
+                        sent_title, sent_body = _startup_text(
+                            startup,  # type: ignore[arg-type]
+                            outcome=result.message,
+                            failed=result.code != 0,
+                        )
+                        _send_bark(config, session, sent_title, sent_body, sleeper)
+                    else:
+                        sent_title, sent_body = _cycle_text(result.message, failed=result.code != 0)
+                        _send_bark(config, session, sent_title, sent_body, sleeper)
+                    result = Result(result.code, result.message)
+                changed = True
+            except AscError as exc:
+                if state.get("_dirty"):
+                    state.pop("_dirty", None)
+                    save_state(state_path, state)
+                fail_notice(exc)
+                raise
+            state.pop("_dirty", None)
+            if changed:
                 save_state(state_path, state)
-            raise
-        state.pop("_dirty", None)
-        if changed:
-            save_state(state_path, state)
-        return result
+            return result
+    except AscError as exc:
+        fail_notice(exc)
+        raise
 
 
 def _mark(state: dict) -> None:
@@ -1254,6 +1484,7 @@ def _run_locked(
     dry_run: bool,
     sleeper: Callable[[float], None],
     mark_changed: Callable[[], None],
+    defer_summary: bool = False,
 ) -> Result:
     client = _client(config, session, sleeper)
     requests_found = client.list_requests()
@@ -1368,6 +1599,9 @@ def _run_locked(
     title = format_title(summary)
     if dry_run:
         return Result(0, prefix + "dry-run：未调用 Bark。\n" + body)
+    message = prefix + "已推送。\n" + title + "\n" + body
+    if defer_summary:
+        return Result(0, message, pending_summary=(title, body, fingerprint, str(day)))
     if not config.bark_key:
         raise AscError("缺少 BARK_KEY。", code=2)
     try:
@@ -1377,7 +1611,7 @@ def _run_locked(
         raise
     state["pushed"][day] = {"fingerprint": fingerprint, "pushed_at": now_iso()}
     mark_changed()
-    return Result(0, prefix + "已推送。\n" + title + "\n" + body)
+    return Result(0, message)
 
 
 def cmd_test_notification(
@@ -1715,15 +1949,36 @@ def cmd_serve(
     def default_clock() -> datetime:
         return datetime.now(tz)
 
-    def default_run() -> Result:
-        return cmd_run(config, session, dry_run=False, sleeper=sleeper)
-
     use_clock = clock or default_clock
-    use_run = runner or default_run
     # Reject a schedule that can never fire before sleeping or fetching.
-    next_occurrence(schedule, use_clock(), tz)
+    started_at = use_clock()
+    nxt = next_occurrence(schedule, started_at, tz)
+    if not config.bark_key:
+        raise AscError("缺少 BARK_KEY。", code=2)
     plan = serve_start_plan(config.data_dir)
+    facts = StartupFacts(
+        schedule=schedule.expression,
+        timezone=tz.key,
+        next_run=nxt.isoformat(timespec="seconds"),
+        immediate=plan.immediate,
+    )
     secrets = config.secret_values()
+    phase = {"startup": plan.immediate and runner is None}
+
+    def default_run() -> Result:
+        if phase["startup"]:
+            phase["startup"] = False
+            return cmd_run(
+                config,
+                session,
+                dry_run=False,
+                sleeper=sleeper,
+                notice="startup",
+                startup=facts,
+            )
+        return cmd_run(config, session, dry_run=False, sleeper=sleeper, notice="cycle")
+
+    use_run = runner or default_run
     if plan.warning:
         emit(plan.warning, secrets, err=True)
     emit(
@@ -1731,6 +1986,12 @@ def cmd_serve(
         f"{plan.notice}"
         "成功或失败都会继续等待；停止容器时，进行中的这一轮会做完再退出。"
     )
+    if runner is None and not plan.immediate:
+        try:
+            title, body = _startup_text(facts)
+            _send_bark(config, session, title, body, sleeper)
+        except AscError as exc:
+            emit(f"启动通知失败，将继续等待。{exc}", secrets, err=True)
 
     def before_run(trigger: str) -> None:
         record_serve_run(config.data_dir, trigger, now=use_clock())
@@ -1792,7 +2053,8 @@ def main(
             result = cmd_test_notification(config, http, sleeper=sleeper)
         else:
             dry_run = bool(getattr(args, "dry_run", False))
-            config = load_config(env, need_apple=True, need_bark=args.command == "run" and not dry_run)
+            need_bark = args.command == "init" or (args.command == "run" and not dry_run)
+            config = load_config(env, need_apple=True, need_bark=need_bark)
             if args.command == "init":
                 result = cmd_init(config, http, snapshot=bool(args.snapshot), sleeper=sleeper)
             else:
@@ -1811,18 +2073,31 @@ def main(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="asc-bark",
-        description="读取 App Store Connect 分析报表的最近一个共同事件日，并推送到 Bark。",
+        description="读取 App Store Connect 分析报表的最近一个共同事件日，并推送到 Bark。serve 在启动和每一轮各发送一条状态。",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init", help="创建 ONGOING 请求；可用 --snapshot 追加一次性历史快照")
+    init = commands.add_parser(
+        "init",
+        help="创建 ONGOING 请求，结束时发送一条 Bark 通知；可用 --snapshot 追加一次性历史快照",
+        description="创建 ONGOING 请求，结束时发送一条 Bark 通知；可用 --snapshot 追加一次性历史快照",
+    )
     init.add_argument("--snapshot", action="store_true", help="若还没有 ONE_TIME_SNAPSHOT，则一并创建")
-    run = commands.add_parser("run", help="读取最新共同事件日；汇总有变化时推送 Bark")
+    run = commands.add_parser(
+        "run",
+        help="读取最新共同事件日；汇总有变化时推送 Bark，没有新汇总时不推送",
+        description="读取最新共同事件日；汇总有变化时推送 Bark，没有新汇总时不推送",
+    )
     run.add_argument("--dry-run", action="store_true", help="只读取并打印汇总，不推送 Bark")
     commands.add_parser(
         "serve",
-        help="按 ASC_SCHEDULE 常驻运行。该数据目录还没有 serve 运行记录时先抓取一次，之后到点再抓取",
+        help="按日程常驻运行；启动时发送一条 Bark 状态，之后每一轮一条结果。还没有 serve 运行记录时先抓取一次",
+        description="按日程常驻运行；启动时发送一条 Bark 状态，之后每一轮一条结果。还没有 serve 运行记录时先抓取一次",
     )
-    commands.add_parser("test-notification", help="只发送一条 Bark 测试通知，不读取 Apple")
+    commands.add_parser(
+        "test-notification",
+        help="只发送一条 Bark 测试通知，不读取 Apple",
+        description="只发送一条 Bark 测试通知，不读取 Apple",
+    )
     return parser.parse_args(argv)
 
 

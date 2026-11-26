@@ -117,6 +117,17 @@ class Response:
         return self._payload
 
 
+def accept_bark(handler, posts=None):
+    def wrapped(method, url, params, body, headers, timeout):
+        if method == "POST" and str(url).startswith("https://bark.test/"):
+            if posts is not None:
+                posts.append(body)
+            return Response(200, {"code": 200, "message": "success"})
+        return handler(method, url, params, body, headers, timeout)
+
+    return wrapped
+
+
 class Session:
     def __init__(self, handler):
         self.handler = handler
@@ -863,6 +874,7 @@ class AscBarkTests(unittest.TestCase):
 
     def test_init_is_idempotent_and_snapshot_is_optional(self):
         store = {"items": [], "posts": [], "gets": 0}
+        barks = []
 
         def handler(method, url, params, body, headers, timeout):
             if method == "POST":
@@ -889,8 +901,12 @@ class AscBarkTests(unittest.TestCase):
             return Response(200, page(data))
 
         delays, sleep = recording_sleeper()
-        created = asc_bark.cmd_init(self.config(bark=False), Session(handler), snapshot=False, sleeper=sleep)
+        created = asc_bark.cmd_init(self.config(), Session(accept_bark(handler, barks)), snapshot=False, sleeper=sleep)
         self.assertIn("已创建 ONGOING", created.message)
+        self.assertIn("已发送初始化通知", created.message)
+        self.assertEqual(len(barks), 1)
+        self.assertIn("ONGOING 请求已创建", barks[0]["body"])
+        self.assertIn("第一份报表通常需要 1–2 天", barks[0]["body"])
         self.assertEqual(len(store["posts"]), 1)
         self.assertEqual(store["posts"][0], {
             "data": {
@@ -899,11 +915,11 @@ class AscBarkTests(unittest.TestCase):
                 "relationships": {"app": {"data": {"type": "apps", "id": APP_ID}}},
             }
         })
-        again = asc_bark.cmd_init(self.config(bark=False), Session(handler), snapshot=True, sleeper=sleep)
+        again = asc_bark.cmd_init(self.config(), Session(accept_bark(handler, barks)), snapshot=True, sleeper=sleep)
         self.assertIn("未重复创建", again.message)
         self.assertIn("已创建 ONE_TIME_SNAPSHOT", again.message)
         self.assertEqual([item["data"]["attributes"]["accessType"] for item in store["posts"]], ["ONGOING", "ONE_TIME_SNAPSHOT"])
-        third = asc_bark.cmd_init(self.config(bark=False), Session(handler), snapshot=True, sleeper=sleep)
+        third = asc_bark.cmd_init(self.config(), Session(accept_bark(handler, barks)), snapshot=True, sleeper=sleep)
         self.assertIn("未重复创建", third.message)
         self.assertEqual(len(store["posts"]), 2)
 
@@ -922,7 +938,12 @@ class AscBarkTests(unittest.TestCase):
             ]
             return Response(200, page(data))
 
-        resumed = asc_bark.cmd_init(self.config(bark=False), Session(stopped_handler), snapshot=False, sleeper=sleep)
+        resumed = asc_bark.cmd_init(
+            self.config(),
+            Session(accept_bark(stopped_handler, barks)),
+            snapshot=False,
+            sleeper=sleep,
+        )
         self.assertIn("停止", resumed.message)
         self.assertEqual(stopped["posts"], ["ONGOING"])
 
@@ -942,7 +963,12 @@ class AscBarkTests(unittest.TestCase):
                 })
             ]))
 
-        paged_result = asc_bark.cmd_init(self.config(bark=False), Session(paged_handler), snapshot=False, sleeper=sleep)
+        paged_result = asc_bark.cmd_init(
+            self.config(),
+            Session(accept_bark(paged_handler, barks)),
+            snapshot=False,
+            sleeper=sleep,
+        )
         self.assertIn("已存在 ONGOING", paged_result.message)
         self.assertEqual(paged["posts"], [])
 
@@ -962,9 +988,20 @@ class AscBarkTests(unittest.TestCase):
                 })
             ]))
 
-        conflicted = asc_bark.cmd_init(self.config(bark=False), Session(conflict_handler), snapshot=False, sleeper=sleep)
+        conflicted = asc_bark.cmd_init(
+            self.config(),
+            Session(accept_bark(conflict_handler, barks)),
+            snapshot=False,
+            sleeper=sleep,
+        )
         self.assertIn("已存在", conflicted.message)
         self.assertEqual(conflict["posts"], 1)
+        self.assertEqual(len(barks), 6)
+        self.assertIn("ONGOING 请求已存在", barks[2]["body"])
+        self.assertIn("ONGOING 请求已创建", barks[3]["body"])
+        self.assertIn("ONGOING 请求已存在", barks[5]["body"])
+        self.assertNotIn(APP_ID, barks[0]["title"] + barks[0]["body"])
+        self.assertNotIn(BARK_KEY, barks[0]["title"] + barks[0]["body"])
         self.assertFalse((self.data / "serve.json").exists())
 
     def test_apple_retries_pagination_and_download_auth(self):
@@ -1097,6 +1134,7 @@ class AscBarkTests(unittest.TestCase):
             once = asc_bark.cmd_run(self.config(), Session(catalog.handler), dry_run=False)
         self.assertEqual(once.code, 0, once.message)
         self.assertIn("init", once.message)
+        self.assertEqual(catalog.posts, [])
         self.assertTrue((self.data / "state.json").exists())
         self.assertFalse((self.data / "serve.json").exists())
 
@@ -1127,8 +1165,21 @@ class AscBarkTests(unittest.TestCase):
         self.assertEqual(served.code, 0, stderr.getvalue())
         self.assertEqual(served.message, "已停止。")
         self.assertTrue(seen["before_fetch"])
-        self.assertEqual(len(session.calls), 1)
-        self.assertEqual(session.calls[0][0], "GET")
+        self.assertEqual([call[0] for call in session.calls], ["GET", "POST"])
+        self.assertTrue(session.calls[1][1].startswith("https://bark.test/push"))
+        startup = session.calls[1][3]
+        self.assertEqual(startup["title"], "asc-bark 已启动")
+        self.assertIn("进程已启动", startup["body"])
+        self.assertIn("日程 0 9 * * *", startup["body"])
+        self.assertIn("时区 Asia/Shanghai", startup["body"])
+        self.assertIn("下次运行 2026-11-26T09:00:00+08:00", startup["body"])
+        self.assertIn("本次启动会立刻抓取", startup["body"])
+        self.assertIn("启动抓取已完成", startup["body"])
+        self.assertIn("请先执行 init", startup["body"])
+        self.assertNotIn("本次启动只等待", startup["body"])
+        self.assertNotIn(APP_ID, startup["title"] + startup["body"])
+        self.assertNotIn(BARK_KEY, startup["title"] + startup["body"])
+        self.assertEqual(len(catalog.posts), 1)
         self.assertIn("先抓取一次", stdout.getvalue())
         self.assertIn("下次运行：2026-11-26T09:00:00+08:00", stdout.getvalue())
         self.assertIn("还没有分析报表请求", stdout.getvalue())
@@ -1152,12 +1203,316 @@ class AscBarkTests(unittest.TestCase):
             )
         self.assertEqual(again.code, 0, stderr.getvalue())
         self.assertEqual(again.message, "已停止。")
-        self.assertEqual(restart.calls, [])
+        self.assertEqual(len(restart.calls), 1)
+        self.assertEqual(restart.calls[0][0], "POST")
+        waiting = restart.calls[0][3]
+        self.assertEqual(waiting["title"], "asc-bark 已启动")
+        self.assertIn("进程已启动", waiting["body"])
+        self.assertIn("本次启动只等待，不会立刻抓取", waiting["body"])
+        self.assertNotIn("本次启动会立刻抓取", waiting["body"])
+        self.assertNotIn("请先执行 init", waiting["body"])
+        self.assertEqual(len(catalog.posts), 2)
         self.assertIn("不会立刻抓取", stdout.getvalue())
         self.assertNotIn("先抓取一次", stdout.getvalue())
         record = json.loads((self.data / "serve.json").read_text(encoding="utf-8"))
         self.assertEqual(record["runs"], 1)
         self.assertEqual(record["first_trigger"], "startup")
+
+    def test_init_requires_bark_before_apple_and_reports_both_outcomes(self):
+        def forbidden(method, url, params, body, headers, timeout):
+            raise AssertionError(method + " " + str(url))
+
+        blocked = Session(forbidden)
+        output = io.StringIO()
+        env = self.env()
+        env.pop("BARK_KEY")
+        with redirect_stdout(output), redirect_stderr(output):
+            code = asc_bark.main(["init"], env, session=blocked)
+        self.assertEqual(code, 2)
+        self.assertIn("缺少 BARK_KEY", output.getvalue())
+        self.assertEqual(blocked.calls, [])
+        self.assertNotIn(BARK_KEY, output.getvalue())
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_init(self.config(bark=False), blocked, snapshot=False)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(blocked.calls, [])
+
+        serve_output = io.StringIO()
+        with redirect_stdout(serve_output), redirect_stderr(serve_output):
+            serve_code = asc_bark.main(["serve"], env, session=blocked)
+        self.assertEqual(serve_code, 2)
+        self.assertIn("缺少 BARK_KEY", serve_output.getvalue())
+        self.assertEqual(blocked.calls, [])
+        self.assertFalse((self.data / "serve.json").exists())
+
+        store = {"items": [], "apples": [], "barks": [], "fail": True}
+
+        def handler(method, url, params, body, headers, timeout):
+            if method == "POST" and str(url).startswith("https://bark.test/"):
+                store["barks"].append(body)
+                if store["fail"]:
+                    return Response(200, {"code": 400, "message": "no"})
+                return Response(200, {"code": 200, "message": "success"})
+            if method == "POST":
+                store["apples"].append(body)
+                store["items"].append("req-1")
+                return Response(201, {"data": {"id": "req-1", "type": "analyticsReportRequests"}})
+            data = [
+                resource("analyticsReportRequests", item, {
+                    "accessType": "ONGOING",
+                    "stoppedDueToInactivity": False,
+                })
+                for item in store["items"]
+            ]
+            return Response(200, page(data))
+
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_init(self.config(), Session(handler), snapshot=False, sleeper=recording_sleeper()[1])
+        self.assertIn("请求仍在", str(caught.exception))
+        self.assertIn("Bark 通知失败", str(caught.exception))
+        self.assertIn("已创建 ONGOING", str(caught.exception))
+        self.assertEqual(len(store["apples"]), 1)
+        self.assertEqual(len(store["barks"]), 1)
+        self.assertIn("ONGOING 请求已创建", store["barks"][0]["body"])
+        self.assertIn("第一份报表通常需要 1–2 天", store["barks"][0]["body"])
+
+        store["fail"] = False
+        again = asc_bark.cmd_init(self.config(), Session(handler), snapshot=False, sleeper=recording_sleeper()[1])
+        self.assertEqual(again.code, 0, again.message)
+        self.assertIn("已存在 ONGOING", again.message)
+        self.assertIn("asc-bark 初始化完成", again.message)
+        self.assertEqual(len(store["apples"]), 1)
+        self.assertEqual(len(store["barks"]), 2)
+        self.assertIn("ONGOING 请求已存在", store["barks"][1]["body"])
+        self.assertIn("第一份报表通常需要 1–2 天", store["barks"][1]["body"])
+        self.assertNotIn(APP_ID, store["barks"][1]["title"] + store["barks"][1]["body"])
+        self.assertNotIn(BARK_KEY, again.message)
+
+        failed = {"barks": []}
+
+        def denied(method, url, params, body, headers, timeout):
+            if method == "POST" and str(url).startswith("https://bark.test/"):
+                failed["barks"].append(body)
+                return Response(200, {"code": 200, "message": "success"})
+            if method == "POST":
+                raise AssertionError("created a request after a read failure")
+            return Response(401, {"errors": [{"status": "401"}]})
+
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_init(self.config(), Session(denied), snapshot=False, sleeper=recording_sleeper()[1])
+        self.assertIn("Admin", str(caught.exception))
+        self.assertNotIn("请求仍在", str(caught.exception))
+        self.assertEqual(len(failed["barks"]), 1)
+        self.assertEqual(failed["barks"][0]["title"], "asc-bark 初始化未完成")
+        self.assertIn("初始化没有完成", failed["barks"][0]["body"])
+        self.assertIn("Admin", failed["barks"][0]["body"])
+        self.assertNotIn("ONGOING 请求已创建", failed["barks"][0]["body"])
+
+        silent = {"barks": []}
+
+        def denied_and_bark_down(method, url, params, body, headers, timeout):
+            if method == "POST" and str(url).startswith("https://bark.test/"):
+                silent["barks"].append(body)
+                return Response(200, {"code": 400, "message": "no"})
+            return Response(403, {"errors": [{"status": "403"}]})
+
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_init(
+                self.config(),
+                Session(denied_and_bark_down),
+                snapshot=False,
+                sleeper=recording_sleeper()[1],
+            )
+        self.assertIn("Admin", str(caught.exception))
+        self.assertIn("Bark 通知失败", str(caught.exception))
+        self.assertNotIn("请求仍在", str(caught.exception))
+        self.assertEqual(len(silent["barks"]), 1)
+
+    def test_serve_startup_folds_summary_and_later_cycles_notify_once(self):
+        catalog = ReadyCatalog()
+        shanghai = ZoneInfo("Asia/Shanghai")
+        now = datetime(2026, 11, 26, 8, 0, tzinfo=shanghai)
+        schedule = asc_bark.parse_schedule("09:00")
+
+        def serve(wait):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = asc_bark.cmd_serve(
+                    self.config(),
+                    Session(catalog.handler),
+                    schedule=schedule,
+                    tz=shanghai,
+                    clock=lambda: now,
+                    wait=wait,
+                    sleeper=recording_sleeper()[1],
+                )
+            return result, stdout.getvalue(), stderr.getvalue()
+
+        started, _stdout, stderr = serve(lambda _delay: True)
+        self.assertEqual(started.code, 0, stderr)
+        self.assertEqual(len(catalog.posts), 1)
+        folded = catalog.posts[0]
+        self.assertEqual(folded["title"], "asc-bark 已启动")
+        self.assertIn("进程已启动", folded["body"])
+        self.assertIn("日程 0 9 * * *", folded["body"])
+        self.assertIn("时区 Asia/Shanghai", folded["body"])
+        self.assertIn("下次运行 2026-11-26T09:00:00+08:00", folded["body"])
+        self.assertIn("本次启动会立刻抓取", folded["body"])
+        self.assertIn("启动抓取已完成，汇总如下", folded["body"])
+        self.assertIn("首次下载 12（事件次数）", folded["body"])
+        self.assertNotIn(APP_ID, folded["title"])
+        self.assertNotIn(BARK_KEY, folded["body"])
+        pushed = json.loads((self.data / "state.json").read_text(encoding="utf-8"))["pushed"]
+        self.assertIn("2024-03-30", pushed)
+
+        waits = {"n": 0}
+
+        def one_cycle(_delay: float) -> bool:
+            waits["n"] += 1
+            return waits["n"] >= 2
+
+        again, _stdout, stderr = serve(one_cycle)
+        self.assertEqual(again.code, 0, stderr)
+        self.assertEqual(len(catalog.posts), 3)
+        self.assertIn("本次启动只等待，不会立刻抓取", catalog.posts[1]["body"])
+        self.assertEqual(catalog.posts[2]["title"], "asc-bark 本轮结果")
+        self.assertIn("本轮已执行", catalog.posts[2]["body"])
+        self.assertIn("没有变化", catalog.posts[2]["body"])
+        self.assertNotIn("首次下载", catalog.posts[2]["body"])
+        self.assertNotIn("本次不推送", catalog.posts[2]["body"])
+
+        changed = DOWNLOADS.replace("\t2\n", "\t4\n", 1)
+        catalog.blobs["dl-daily"] = gzip_text(changed)
+        waits["n"] = 0
+        updated, _stdout, stderr = serve(one_cycle)
+        self.assertEqual(updated.code, 0, stderr)
+        self.assertEqual(len(catalog.posts), 5)
+        self.assertEqual(catalog.posts[3]["title"], "asc-bark 已启动")
+        self.assertIn("只等待", catalog.posts[3]["body"])
+        self.assertEqual(catalog.posts[4]["title"], "Sample 2024-03-30")
+        self.assertIn("首次下载 14（事件次数）", catalog.posts[4]["body"])
+        self.assertNotIn("本轮已执行", catalog.posts[4]["body"])
+        self.assertNotIn("asc-bark 本轮结果", catalog.posts[4]["title"])
+
+    def test_scheduled_cycle_reports_quiet_results_and_failures(self):
+        def quiet(setup):
+            if (self.data / "state.json").exists():
+                (self.data / "state.json").unlink()
+            catalog = setup()
+            result = asc_bark.cmd_run(
+                self.config(),
+                Session(catalog.handler),
+                dry_run=False,
+                sleeper=recording_sleeper()[1],
+                notice="cycle",
+            )
+            self.assertEqual(result.code, 0, result.message)
+            self.assertEqual(len(catalog.posts), 1)
+            notice = catalog.posts[0]
+            self.assertEqual(notice["title"], "asc-bark 本轮结果")
+            self.assertIn("本轮已执行", notice["body"])
+            self.assertNotIn("本次不推送", notice["body"])
+            self.assertNotIn(BARK_KEY, notice["body"])
+            return notice["body"]
+
+        self.assertIn("请先执行 init", quiet(lambda: self._quiet_catalog(no_requests=True)))
+        self.assertIn("还没有列出", quiet(lambda: self._quiet_catalog(no_reports=True)))
+        self.assertIn("还没有 DAILY 实例", quiet(lambda: self._quiet_catalog(no_instances=True)))
+        self.assertIn("还没有可下载分段", quiet(lambda: self._quiet_catalog(pending=True)))
+        self.assertIn("没有共同事件日", quiet(self._disjoint_catalog))
+        self.assertIn("没有把缺失的一天补成 0", quiet(self._disjoint_catalog))
+
+        if (self.data / "state.json").exists():
+            (self.data / "state.json").unlink()
+        same = ReadyCatalog()
+        first = asc_bark.cmd_run(
+            self.config(),
+            Session(same.handler),
+            dry_run=False,
+            sleeper=recording_sleeper()[1],
+            notice="cycle",
+        )
+        self.assertIn("已推送", first.message)
+        self.assertEqual(same.posts[0]["title"], "Sample 2024-03-30")
+        self.assertEqual(len(same.posts), 1)
+        second = asc_bark.cmd_run(
+            self.config(),
+            Session(same.handler),
+            dry_run=False,
+            sleeper=recording_sleeper()[1],
+            notice="cycle",
+        )
+        self.assertIn("没有变化", second.message)
+        self.assertEqual(len(same.posts), 2)
+        self.assertIn("没有变化", same.posts[1]["body"])
+
+        denied = {"posts": []}
+
+        def denied_handler(method, url, params, body, headers, timeout):
+            if method == "POST" and str(url).startswith("https://bark.test/"):
+                denied["posts"].append(body)
+                return Response(200, {"code": 200, "message": "success"})
+            return Response(401, {"errors": [{"status": "401"}]})
+
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_run(
+                self.config(),
+                Session(denied_handler),
+                dry_run=False,
+                sleeper=recording_sleeper()[1],
+                notice="cycle",
+            )
+        self.assertIn("Admin", str(caught.exception))
+        self.assertEqual(len(denied["posts"]), 1)
+        self.assertEqual(denied["posts"][0]["title"], "asc-bark 本轮失败")
+        self.assertIn("本轮已执行，但没有完成", denied["posts"][0]["body"])
+        self.assertIn("Admin", denied["posts"][0]["body"])
+
+        if (self.data / "state.json").exists():
+            (self.data / "state.json").unlink()
+        failed_push = ReadyCatalog()
+        failed_push.bark_codes = [400]
+        facts = asc_bark.StartupFacts(
+            schedule="0 9 * * *",
+            timezone="Asia/Shanghai",
+            next_run="2026-11-26T09:00:00+08:00",
+            immediate=True,
+        )
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_run(
+                self.config(),
+                Session(failed_push.handler),
+                dry_run=False,
+                sleeper=recording_sleeper()[1],
+                notice="startup",
+                startup=facts,
+            )
+        self.assertTrue(caught.exception.bark_attempted)
+        self.assertEqual(len(failed_push.posts), 1)
+        self.assertIn("进程已启动", failed_push.posts[0]["body"])
+        self.assertIn("本次启动会立刻抓取", failed_push.posts[0]["body"])
+        self.assertIn("首次下载", failed_push.posts[0]["body"])
+        saved = json.loads((self.data / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["pushed"], {})
+
+    def _quiet_catalog(self, **flags):
+        catalog = ReadyCatalog()
+        for name, enabled in flags.items():
+            if name == "pending":
+                catalog.pending_newest = enabled
+            else:
+                setattr(catalog, name, enabled)
+        return catalog
+
+    def _disjoint_catalog(self):
+        return ReadyCatalog(
+            downloads_text=tsv(
+                DL_HEADER,
+                [dl_row("2024-03-31", "First-time Download", 1), dl_row("2024-03-31", "Redownload", 1)],
+            ),
+            discovery_text=tsv(DISC_HEADER, [disc_row("2024-03-29", "Impression", "No page", 3, 1)]),
+        )
 
     def test_corrupt_state_is_not_overwritten(self):
         path = self.data / "state.json"
