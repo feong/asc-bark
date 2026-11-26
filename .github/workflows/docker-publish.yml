@@ -14,6 +14,8 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/feong/asc-bark
+  # One manifest list. docker pull selects the image for the machine.
+  PLATFORMS: linux/amd64,linux/arm64/v8
 
 jobs:
   test:
@@ -33,21 +35,8 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -t . -v
 
-  verify-image:
+  image:
     name: Build image
-    if: github.event_name == 'pull_request'
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Build image
-        run: docker build -t asc-bark:ci .
-
-  publish:
-    name: Publish to GHCR
-    if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -57,10 +46,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.4.0
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.4.1
 
       - name: Log in to GHCR
+        if: github.event_name == 'push'
         uses: docker/login-action@v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -69,6 +64,7 @@ jobs:
 
       - name: Extract image tags
         id: meta
+        if: github.event_name == 'push'
         uses: docker/metadata-action@v6.2.0
         with:
           images: ${{ env.IMAGE }}
@@ -79,16 +75,120 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
 
-      - name: Build and push
+      - name: Build image for both platforms
+        if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v7.4.0
         with:
           context: .
+          platforms: ${{ env.PLATFORMS }}
+          outputs: type=oci,dest=/tmp/asc-bark-image.tar
+          provenance: false
+
+      - name: Verify both platforms
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 - << 'PY'
+          import json
+          import os
+          import sys
+          import tarfile
+
+          path = "/tmp/asc-bark-image.tar"
+
+          class Layout:
+              def __init__(self, root):
+                  self.root = root
+                  self.archive = None
+
+              def read_json(self, name):
+                  if self.archive is None:
+                      with open(os.path.join(self.root, name), encoding="utf-8") as handle:
+                          return json.load(handle)
+                  member = self.archive.extractfile(self._member(name))
+                  return json.load(member)
+
+              def _member(self, name):
+                  wanted = name.lstrip("./")
+                  matches = [
+                      item
+                      for item in self.archive.getnames()
+                      if item.lstrip("./") == wanted
+                  ]
+                  if not matches:
+                      raise FileNotFoundError(name)
+                  return min(matches, key=len)
+
+          layout = Layout(path)
+          if not os.path.isdir(path):
+              layout.archive = tarfile.open(path)
+
+          def platforms_in(document, seen):
+              found = []
+              for item in document.get("manifests") or []:
+                  platform = item.get("platform") or {}
+                  os_name = platform.get("os") or ""
+                  architecture = platform.get("architecture") or ""
+                  if os_name not in ("", "unknown") and architecture not in ("", "unknown"):
+                      found.append(
+                          {
+                              "os": os_name,
+                              "architecture": architecture,
+                              "variant": platform.get("variant") or "",
+                          }
+                      )
+                  media_type = item.get("mediaType") or ""
+                  digest = item.get("digest") or ""
+                  nested = "index" in media_type or "list" in media_type
+                  if digest and nested and digest not in seen:
+                      seen.add(digest)
+                      algo, digest_hex = digest.split(":", 1)
+                      found.extend(
+                          platforms_in(
+                              layout.read_json(f"blobs/{algo}/{digest_hex}"),
+                              seen,
+                          )
+                      )
+              return found
+
+          found = platforms_in(layout.read_json("index.json"), set())
+          if layout.archive is not None:
+              layout.archive.close()
+
+          def normalize(item):
+              # Buildx omits the default arm64 variant. An empty variant is v8.
+              variant = item["variant"]
+              if item["architecture"] == "arm64" and variant in ("", "v8"):
+                  variant = "v8"
+              return {
+                  "os": item["os"],
+                  "architecture": item["architecture"],
+                  "variant": variant,
+              }
+
+          found = [normalize(item) for item in found]
+          print(json.dumps(found, indent=2))
+          required = [
+              {"os": "linux", "architecture": "amd64", "variant": ""},
+              {"os": "linux", "architecture": "arm64", "variant": "v8"},
+          ]
+          missing = [item for item in required if item not in found]
+          if missing:
+              print("missing platforms:", json.dumps(missing), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Build and push
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Make the package public
-        if: github.event.repository.visibility == 'public'
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
