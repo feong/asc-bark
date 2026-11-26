@@ -1,14 +1,20 @@
+# Long-running service. Start it with: docker compose up -d
+# Published image: docker compose pull && docker compose up -d --no-build
+# One-shot commands: docker compose run --rm asc-bark init
+
 services:
   asc-bark:
+    image: ghcr.io/feong/asc-bark:${ASC_IMAGE_TAG:-latest}
     build: .
-    image: asc-bark:local
     user: "10001:10001"
+    restart: unless-stopped
+    stop_grace_period: 5m
     env_file:
       - .env
     environment:
-      TZ: Asia/Shanghai
       ASC_DATA_DIR: /data
       ASC_PRIVATE_KEY_PATH: /secrets/AuthKey.p8
+    command: ["serve"]
     volumes:
       - ./data:/data
       - ./secrets/AuthKey.p8:/secrets/AuthKey.p8:ro

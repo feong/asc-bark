@@ -1,0 +1,118 @@
+name: Docker image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/feong/asc-bark
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+  verify-image:
+    name: Build image
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Build image
+        run: docker build -t asc-bark:ci .
+
+  publish:
+    name: Publish to GHCR
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image tags
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # latest tracks main. A version tag is published under its own name.
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Make the package public
+        if: github.event.repository.visibility == 'public'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          try_public() {
+            gh api --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "$1" \
+              -f visibility=public >/dev/null
+          }
+          for attempt in 1 2 3 4 5 6; do
+            if try_public "/user/packages/container/${package}/visibility" \
+              || try_public "/user/packages/container/${package}" \
+              || try_public "/users/${owner}/packages/container/${package}/visibility" \
+              || try_public "/users/${owner}/packages/container/${package}" \
+              || try_public "/orgs/${owner}/packages/container/${package}/visibility" \
+              || try_public "/orgs/${owner}/packages/container/${package}"; then
+              echo "ghcr.io/${owner}/${package} is public."
+              exit 0
+            fi
+            echo "Package visibility is not ready yet (attempt ${attempt})."
+            sleep 5
+          done
+          echo "Could not set ghcr.io/${owner}/${package} to public with GITHUB_TOKEN."
+          exit 1

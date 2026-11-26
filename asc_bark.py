@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Send one App Store Connect analytics summary to Bark.
+"""Send App Store Connect analytics summaries to Bark.
+
+``run`` fetches one summary and exits. ``serve`` stays up, waits for the next
+time in ``ASC_SCHEDULE``, runs that same fetch and push, then waits again.
+The schedule is interpreted in the ``TZ`` timezone.
 
 This uses the Analytics Reports API only. It does not call Sales and Trends
 and it does not scrape the App Store Connect website.
@@ -29,13 +33,15 @@ import io
 import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
 import traceback
 import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
 from urllib.parse import urlparse
@@ -62,6 +68,15 @@ MAX_REPORT_BYTES = 32 * 1024 * 1024
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 STATE_VERSION = 1
 ACCESS_RANK = {"ONGOING": 2, "ONE_TIME_SNAPSHOT": 1}
+DEFAULT_SCHEDULE = "09:00"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+SCHEDULE_HORIZON_YEARS = 8
+SHUTDOWN_POLL_SECONDS = 1.0
+SCHEDULE_HINT = (
+    "ASC_SCHEDULE 应为每天的时刻 HH:MM（例如 09:00），"
+    "或五段 cron：分 时 日 月 周（例如 0 9 * * *）。"
+    "周几用数字，0 和 7 都是星期日。"
+)
 
 REPORT_SPECS = (
     {
@@ -1295,18 +1310,348 @@ def _known_secrets(env: Mapping[str, str]) -> list[str]:
     return secrets
 
 
+@dataclass(frozen=True)
+class Schedule:
+    """A five-field cron schedule.
+
+    ``day_any`` and ``weekday_any`` are true only when that field is ``*``.
+    When both day-of-month and day-of-week are restricted, a date matches if
+    either field matches (standard cron). ``weekdays`` uses Sunday = 0.
+    """
+
+    minutes: frozenset[int]
+    hours: frozenset[int]
+    days: frozenset[int]
+    months: frozenset[int]
+    weekdays: frozenset[int]
+    day_any: bool
+    weekday_any: bool
+    expression: str
+
+
+def _parse_cron_field(token: str, low: int, high: int) -> frozenset[int]:
+    values: set[int] = set()
+    for part in token.split(","):
+        match = re.fullmatch(r"(\*|\d{1,2}(?:-\d{1,2})?)(?:/(\d{1,4}))?", part)
+        if not match:
+            raise AscError(f"ASC_SCHEDULE 无法解析“{token}”。{SCHEDULE_HINT}", code=2)
+        base, step_text = match.group(1), match.group(2)
+        step = 1
+        if step_text is not None:
+            step = int(step_text)
+            if step <= 0:
+                raise AscError("ASC_SCHEDULE 的步长必须大于 0。", code=2)
+        if base == "*":
+            start, end = low, high
+        elif "-" in base:
+            left, right = base.split("-", 1)
+            start, end = int(left), int(right)
+            if start > end:
+                raise AscError(f"ASC_SCHEDULE 的范围无效：{part}。", code=2)
+        else:
+            start = end = int(base)
+            if step_text is not None:
+                end = high
+        if start < low or end > high:
+            raise AscError(f"ASC_SCHEDULE 字段超出 {low}-{high}：{part}。", code=2)
+        values.update(range(start, end + 1, step))
+    if not values:
+        raise AscError(f"ASC_SCHEDULE 字段没有可用的值：{token}。", code=2)
+    return frozenset(values)
+
+
+def parse_schedule(value: str) -> Schedule:
+    text = " ".join(value.strip().split())
+    if not text:
+        raise AscError(f"ASC_SCHEDULE 不能为空。{SCHEDULE_HINT}", code=2)
+    daily = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if daily:
+        hour, minute = int(daily.group(1)), int(daily.group(2))
+        if hour > 23 or minute > 59:
+            raise AscError(f"ASC_SCHEDULE 的时刻无效：{text}。{SCHEDULE_HINT}", code=2)
+        fields = [str(minute), str(hour), "*", "*", "*"]
+    else:
+        fields = text.split(" ")
+        if len(fields) != 5:
+            raise AscError(SCHEDULE_HINT, code=2)
+    weekdays = set(_parse_cron_field(fields[4], 0, 7))
+    if 7 in weekdays:
+        weekdays.discard(7)
+        weekdays.add(0)
+    return Schedule(
+        minutes=_parse_cron_field(fields[0], 0, 59),
+        hours=_parse_cron_field(fields[1], 0, 23),
+        days=_parse_cron_field(fields[2], 1, 31),
+        months=_parse_cron_field(fields[3], 1, 12),
+        weekdays=frozenset(weekdays),
+        day_any=fields[2] == "*",
+        weekday_any=fields[4] == "*",
+        expression=" ".join(fields),
+    )
+
+
+def schedule_from_env(env: Mapping[str, str]) -> Schedule:
+    raw = (env.get("ASC_SCHEDULE") or "").strip()
+    return parse_schedule(raw or DEFAULT_SCHEDULE)
+
+
+def timezone_from_env(env: Mapping[str, str]) -> ZoneInfo:
+    name = (env.get("TZ") or "").strip() or DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        raise AscError(f"时区无法识别：{name}。", code=2) from None
+
+
+def _cron_weekday(day: date) -> int:
+    """Cron weekday: Sunday is 0 and Saturday is 6."""
+
+    return (day.weekday() + 1) % 7
+
+
+def _calendar_day_matches(schedule: Schedule, day: date) -> bool:
+    dom_ok = day.day in schedule.days
+    dow_ok = _cron_weekday(day) in schedule.weekdays
+    if schedule.day_any and schedule.weekday_any:
+        return True
+    if schedule.day_any:
+        return dow_ok
+    if schedule.weekday_any:
+        return dom_ok
+    return dom_ok or dow_ok
+
+
+def _is_real_wall_time(candidate: datetime) -> bool:
+    tz = candidate.tzinfo
+    if tz is None:
+        return False
+    try:
+        back = candidate.astimezone(timezone.utc).astimezone(tz)
+    except (OSError, OverflowError, ValueError):
+        return False
+    return (
+        back.year == candidate.year
+        and back.month == candidate.month
+        and back.day == candidate.day
+        and back.hour == candidate.hour
+        and back.minute == candidate.minute
+        and back.fold == candidate.fold
+    )
+
+
+def _wall_instants(year: int, month: int, day: int, hour: int, minute: int, tz: ZoneInfo) -> list[datetime]:
+    found: list[datetime] = []
+    seen: set[float] = set()
+    for fold in (0, 1):
+        try:
+            candidate = datetime(year, month, day, hour, minute, tzinfo=tz, fold=fold)
+        except (OverflowError, ValueError):
+            continue
+        if not _is_real_wall_time(candidate):
+            continue
+        stamp = candidate.timestamp()
+        if stamp in seen:
+            continue
+        seen.add(stamp)
+        found.append(candidate)
+    return found
+
+
+def next_occurrence(schedule: Schedule, now: datetime, tz: ZoneInfo) -> datetime:
+    """Return the next scheduled instant strictly after ``now``.
+
+    Missing local times (daylight-saving gaps) are skipped. A repeated local
+    time yields both instants, and the earlier one still in the future wins.
+    """
+
+    if now.tzinfo is None:
+        local_now = now.replace(tzinfo=tz)
+    else:
+        local_now = now.astimezone(tz)
+    cursor = local_now.date()
+    try:
+        horizon = cursor.replace(year=cursor.year + SCHEDULE_HORIZON_YEARS)
+    except ValueError:
+        horizon = date(cursor.year + SCHEDULE_HORIZON_YEARS, 3, 1)
+    while cursor <= horizon:
+        if cursor.month in schedule.months and _calendar_day_matches(schedule, cursor):
+            instants: list[datetime] = []
+            for hour in sorted(schedule.hours):
+                for minute in sorted(schedule.minutes):
+                    instants.extend(
+                        _wall_instants(cursor.year, cursor.month, cursor.day, hour, minute, tz)
+                    )
+            instants.sort(key=lambda item: item.timestamp())
+            # Same tzinfo compares wall time and ignores fold, so use timestamps.
+            now_stamp = local_now.timestamp()
+            for instant in instants:
+                if instant.timestamp() > now_stamp:
+                    return instant
+        cursor += timedelta(days=1)
+    raise AscError("ASC_SCHEDULE 在未来 8 年内没有匹配的时间。", code=2)
+
+
+def install_shutdown(
+    poll_seconds: float = SHUTDOWN_POLL_SECONDS,
+) -> tuple[Callable[[], bool], Callable[[float], bool], Callable[[], None]]:
+    """Catch SIGTERM and SIGINT. ``wait`` returns True when stopping.
+
+    The wait is polled so ``docker stop`` is noticed even when the main thread
+    is blocked. Handlers are restored by the returned function.
+    """
+
+    flag = threading.Event()
+
+    def handler(signum: int, frame: object) -> None:
+        flag.set()
+
+    previous: list[tuple[signal.Signals, signal.Handlers]] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous.append((sig, signal.getsignal(sig)))
+        signal.signal(sig, handler)
+
+    def restore() -> None:
+        for sig, old in previous:
+            signal.signal(sig, old)
+
+    def wait(seconds: float) -> bool:
+        if seconds < 0:
+            seconds = 0.0
+        deadline = time.monotonic() + seconds
+        while True:
+            if flag.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if flag.wait(min(poll_seconds, remaining)):
+                return True
+
+    return flag.is_set, wait, restore
+
+
+def serve_loop(
+    schedule: Schedule,
+    tz: ZoneInfo,
+    run_once: Callable[[], Result],
+    *,
+    clock: Callable[[], datetime],
+    wait: Callable[[float], bool],
+    secrets: list[str] | None = None,
+) -> int:
+    """Wait for the schedule, run once, and repeat until ``wait`` asks to stop.
+
+    A successful result, a non-zero result, ``AscError``, and any other
+    exception are logged. None of them ends the loop. The data-directory lock
+    inside a normal run still rejects a second fetch while one is in progress.
+    This function returns 0 only after shutdown.
+    """
+
+    hidden = secrets or []
+    while True:
+        now = clock()
+        nxt = next_occurrence(schedule, now, tz)
+        anchor = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
+        # Subtraction keeps the wall clock when both values share a tzinfo,
+        # which collapses a repeated daylight-saving hour to a zero delay.
+        delay = nxt.timestamp() - anchor.timestamp()
+        if delay < 0:
+            delay = 0.0
+        emit(f"下次运行：{nxt.isoformat(timespec='seconds')}", hidden)
+        if wait(delay):
+            return 0
+        try:
+            result = run_once()
+        except AscError as exc:
+            emit(f"本次运行失败，将等到下一个日程。{exc}", hidden, err=True)
+            continue
+        except Exception:
+            emit("本次运行失败，将等到下一个日程。", hidden, err=True)
+            emit(redact(traceback.format_exc(), hidden), hidden, err=True)
+            continue
+        emit(result.message, hidden, err=result.code != 0)
+        if result.code != 0:
+            emit("本次未成功，将等到下一个日程。", hidden, err=True)
+
+
+def cmd_serve(
+    config: Config,
+    session: requests.Session,
+    *,
+    schedule: Schedule,
+    tz: ZoneInfo,
+    sleeper: Callable[[float], None] = time.sleep,
+    clock: Callable[[], datetime] | None = None,
+    wait: Callable[[float], bool] | None = None,
+    runner: Callable[[], Result] | None = None,
+) -> Result:
+    def default_clock() -> datetime:
+        return datetime.now(tz)
+
+    def default_run() -> Result:
+        return cmd_run(config, session, dry_run=False, sleeper=sleeper)
+
+    use_clock = clock or default_clock
+    use_run = runner or default_run
+    # Reject a schedule that can never fire before sleeping.
+    next_occurrence(schedule, use_clock(), tz)
+    emit(
+        f"按日程运行：{schedule.expression}，时区 {tz.key}。"
+        "启动后先等待下一次，不会立刻抓取。"
+        "成功或失败都会继续等待；停止容器时，进行中的这一轮会做完再退出。"
+    )
+
+    def noop() -> None:
+        return None
+
+    restore = noop
+    use_wait = wait
+    if use_wait is None:
+        _stopped, use_wait, restore = install_shutdown()
+    try:
+        serve_loop(
+            schedule,
+            tz,
+            use_run,
+            clock=use_clock,
+            wait=use_wait,
+            secrets=config.secret_values(),
+        )
+    finally:
+        restore()
+    return Result(0, "已停止。")
+
+
 def main(
     argv: list[str] | None = None,
     environ: Mapping[str, str] | None = None,
     session: requests.Session | None = None,
     sleeper: Callable[[float], None] = time.sleep,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    wait: Callable[[float], bool] | None = None,
+    runner: Callable[[], Result] | None = None,
 ) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     env = os.environ if environ is None else environ
     secrets = _known_secrets(env)
     http = session if session is not None else requests.Session()
     try:
-        if args.command == "test-notification":
+        if args.command == "serve":
+            schedule = schedule_from_env(env)
+            tz = timezone_from_env(env)
+            config = load_config(env, need_apple=True, need_bark=True)
+            result = cmd_serve(
+                config,
+                http,
+                schedule=schedule,
+                tz=tz,
+                sleeper=sleeper,
+                clock=clock,
+                wait=wait,
+                runner=runner,
+            )
+        elif args.command == "test-notification":
             config = load_config(env, need_apple=False, need_bark=True)
             result = cmd_test_notification(config, http, sleeper=sleeper)
         else:
@@ -1337,6 +1682,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     init.add_argument("--snapshot", action="store_true", help="若还没有 ONE_TIME_SNAPSHOT，则一并创建")
     run = commands.add_parser("run", help="读取最新共同事件日；汇总有变化时推送 Bark")
     run.add_argument("--dry-run", action="store_true", help="只读取并打印汇总，不推送 Bark")
+    commands.add_parser(
+        "serve",
+        help="按 ASC_SCHEDULE 常驻运行；到点执行与 run 相同的抓取和推送",
+    )
     commands.add_parser("test-notification", help="只发送一条 Bark 测试通知，不读取 Apple")
     return parser.parse_args(argv)
 
