@@ -26,6 +26,27 @@ def _fixed(moment: datetime):
     return clock
 
 
+class _BarkResponse:
+    def __init__(self):
+        self.status_code = 200
+        self.headers = {}
+
+    def json(self):
+        return {"code": 200, "message": "success"}
+
+
+class _BarkSession:
+    def __init__(self):
+        self.posts = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.posts.append(json)
+        return _BarkResponse()
+
+    def get(self, *args, **kwargs):
+        raise AssertionError("unexpected GET")
+
+
 class ScheduleParseTests(unittest.TestCase):
     def test_defaults_match_the_documented_schedule(self):
         self.assertEqual(asc_bark.DEFAULT_SCHEDULE, "09:00")
@@ -426,6 +447,7 @@ class ServeLoopTests(unittest.TestCase):
             data_dir=self.data,
         )
         state = {"waits": 0}
+        session = _BarkSession()
 
         def wait(_delay: float) -> bool:
             state["waits"] += 1
@@ -437,7 +459,7 @@ class ServeLoopTests(unittest.TestCase):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 result = asc_bark.cmd_serve(
                     config,
-                    session=object(),
+                    session=session,
                     schedule=self.schedule,
                     tz=SHANGHAI,
                     clock=_fixed(self.now),
@@ -451,6 +473,15 @@ class ServeLoopTests(unittest.TestCase):
         self.assertIn("正在运行", stderr.getvalue())
         self.assertIn("将等到下一个日程", stderr.getvalue())
         self.assertGreaterEqual(stdout.getvalue().count("下次运行"), 3)
+        self.assertEqual(len(session.posts), 3)
+        self.assertEqual(session.posts[0]["title"], "asc-bark 已启动")
+        self.assertIn("本次启动会立刻抓取", session.posts[0]["body"])
+        self.assertIn("启动抓取没有完成", session.posts[0]["body"])
+        self.assertIn("正在运行", session.posts[0]["body"])
+        self.assertEqual(session.posts[1]["title"], "asc-bark 本轮失败")
+        self.assertEqual(session.posts[2]["title"], "asc-bark 本轮失败")
+        self.assertIn("正在运行", session.posts[1]["body"])
+        self.assertNotIn("bark-device-key-0001", session.posts[0]["body"])
 
     def test_unreachable_schedule_does_not_run(self):
         def runner():
@@ -718,6 +749,18 @@ class ServeLoopTests(unittest.TestCase):
         self.assertEqual(asc_bark.parse_args(["init"]).command, "init")
         self.assertTrue(asc_bark.parse_args(["init", "--snapshot"]).snapshot)
         self.assertEqual(asc_bark.parse_args(["test-notification"]).command, "test-notification")
+
+        def help_text(argv: list[str]) -> str:
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+                asc_bark.parse_args(argv)
+            self.assertEqual(caught.exception.code, 0)
+            return output.getvalue()
+
+        self.assertIn("Bark", help_text(["init", "--help"]))
+        self.assertIn("结束时发送一条", help_text(["init", "--help"]))
+        self.assertIn("没有新汇总时不推送", help_text(["run", "--help"]))
+        self.assertIn("启动时发送一条", help_text(["serve", "--help"]))
 
 
 class DeployContractTests(unittest.TestCase):
