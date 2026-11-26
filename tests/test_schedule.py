@@ -488,6 +488,7 @@ class DeployContractTests(unittest.TestCase):
         self.assertIn("docker/setup-qemu-action@v4.4.0", workflow)
         self.assertIn("outputs: type=oci,dest=/tmp/asc-bark-image.tar", workflow)
         self.assertIn('{"os": "linux", "architecture": "arm64", "variant": "v8"}', workflow)
+        self.assertIn('item["architecture"] == "arm64" and variant in ("", "v8")', workflow)
         self.assertIn("linux/amd64", readme)
         self.assertIn("linux/arm64/v8", readme)
 

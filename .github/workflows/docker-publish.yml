@@ -153,6 +153,19 @@ jobs:
           found = platforms_in(layout.read_json("index.json"), set())
           if layout.archive is not None:
               layout.archive.close()
+
+          def normalize(item):
+              # Buildx omits the default arm64 variant. An empty variant is v8.
+              variant = item["variant"]
+              if item["architecture"] == "arm64" and variant in ("", "v8"):
+                  variant = "v8"
+              return {
+                  "os": item["os"],
+                  "architecture": item["architecture"],
+                  "variant": variant,
+              }
+
+          found = [normalize(item) for item in found]
           print(json.dumps(found, indent=2))
           required = [
               {"os": "linux", "architecture": "amd64", "variant": ""},
