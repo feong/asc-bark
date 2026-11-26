@@ -4,6 +4,12 @@
 
 这是一个跑完即退出的命令，不是网站、服务或常驻进程。调度由宿主机完成，例如 1Panel 的计划任务。目标 App、密钥和 Bark 都在运行时配置，程序里没有写死任何 App。
 
+源码：<https://github.com/feong/asc-bark>
+
+```bash
+git clone https://github.com/feong/asc-bark.git
+```
+
 官方说明：
 
 - [Analytics Reports API 概览](https://developer.apple.com/help/app-store-connect-analytics/overview/analytics-reports-api/)
