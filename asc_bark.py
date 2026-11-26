@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Send App Store Connect analytics summaries to Bark.
 
-``run`` fetches one summary and exits. ``serve`` stays up, waits for the next
-time in ``ASC_SCHEDULE``, runs that same fetch and push, then waits again.
-The schedule is interpreted in the ``TZ`` timezone.
+``run`` fetches one summary and exits. ``serve`` stays up. The first time it
+starts in a data directory with no recorded serve cycle, it fetches once
+immediately, then waits for the next time in ``ASC_SCHEDULE``. Later starts
+wait for that time and do not fetch just because the process started. A
+one-shot ``run`` does not record a serve cycle. The schedule is interpreted
+in the ``TZ`` timezone.
 
 This uses the Analytics Reports API only. It does not call Sales and Trends
 and it does not scrape the App Store Connect website.
@@ -67,6 +70,8 @@ MAX_BACKOFF_SECONDS = 8
 MAX_REPORT_BYTES = 32 * 1024 * 1024
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 STATE_VERSION = 1
+SERVE_RECORD_VERSION = 1
+SERVE_RECORD_NAME = "serve.json"
 ACCESS_RANK = {"ONGOING": 2, "ONE_TIME_SNAPSHOT": 1}
 DEFAULT_SCHEDULE = "09:00"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -589,7 +594,7 @@ def load_state(path: Path) -> dict:
     return data
 
 
-def save_state(path: Path, data: dict) -> None:
+def _atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -605,8 +610,110 @@ def save_state(path: Path, data: dict) -> None:
             os.unlink(temporary)
         except OSError:
             pass
-        raise AscError("无法写入状态文件。") from None
+        raise
     os.chmod(path, 0o600)
+
+
+def save_state(path: Path, data: dict) -> None:
+    try:
+        _atomic_json(path, data)
+    except OSError:
+        raise AscError("无法写入状态文件。") from None
+
+
+@dataclass(frozen=True)
+class ServeStart:
+    """Whether this ``serve`` process should fetch before the first wait."""
+
+    immediate: bool
+    notice: str
+    warning: str | None = None
+
+
+def _serve_run_count(data: object) -> int | None:
+    if not isinstance(data, dict) or data.get("version") != SERVE_RECORD_VERSION:
+        return None
+    runs = data.get("runs")
+    if isinstance(runs, bool) or not isinstance(runs, int) or runs < 0:
+        return None
+    return runs
+
+
+def _load_serve_record(path: Path) -> tuple[dict | None, str | None]:
+    """Return ``(record, error)``.
+
+    ``record`` is None when the file is missing or cannot be used. ``error``
+    is set only when the file exists and must be left untouched.
+    """
+
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "serve 运行记录无法读取，未覆盖它。"
+    if not isinstance(data, dict) or _serve_run_count(data) is None:
+        return None, "serve 运行记录版本无法识别，未覆盖它。"
+    return data, None
+
+
+def serve_start_plan(data_dir: Path) -> ServeStart:
+    """Decide whether this ``serve`` process should fetch before waiting.
+
+    A serve cycle is recorded in ``serve.json`` when it starts. ``startup`` is
+    the cycle that runs because no earlier serve cycle was recorded.
+    ``schedule`` is a cycle that waited for ``ASC_SCHEDULE`` first. ``run``
+    does not write this file, so a one-shot run is not a recorded serve cycle.
+    A missing file and ``"runs": 0`` both mean serve has never started a cycle
+    here. An unreadable or unrecognized file is left in place and does not
+    start an immediate cycle.
+    """
+
+    data, error = _load_serve_record(data_dir / SERVE_RECORD_NAME)
+    if error:
+        return ServeStart(False, "本次启动不立刻抓取，将等待下一次日程。", error)
+    runs = 0 if data is None else _serve_run_count(data)
+    if not runs:
+        return ServeStart(
+            True,
+            "数据目录还没有 serve 触发过的运行记录，启动后先抓取一次，再等待下一次日程。",
+        )
+    return ServeStart(False, "已有 serve 运行记录，启动后先等待下一次，不会立刻抓取。")
+
+
+def record_serve_run(data_dir: Path, trigger: str, *, now: datetime) -> None:
+    """Remember that a serve cycle is starting. Does not run a fetch."""
+
+    if trigger not in ("startup", "schedule"):
+        raise AscError("无法写入 serve 运行记录。")
+    path = data_dir / SERVE_RECORD_NAME
+    data, error = _load_serve_record(path)
+    if error:
+        raise AscError(error)
+    started = now.isoformat(timespec="seconds")
+    if data is None:
+        data = {
+            "version": SERVE_RECORD_VERSION,
+            "runs": 1,
+            "first_trigger": trigger,
+            "first_started_at": started,
+            "last_trigger": trigger,
+            "last_started_at": started,
+        }
+    else:
+        runs = _serve_run_count(data) or 0
+        if runs == 0:
+            data["first_trigger"] = trigger
+            data["first_started_at"] = started
+            data["runs"] = 1
+        else:
+            data["runs"] = runs + 1
+        data["last_trigger"] = trigger
+        data["last_started_at"] = started
+    try:
+        _atomic_json(path, data)
+    except OSError:
+        raise AscError("无法写入 serve 运行记录。") from None
 
 
 def checksum_matches(blob: bytes, checksum: str) -> bool:
@@ -1538,16 +1645,47 @@ def serve_loop(
     clock: Callable[[], datetime],
     wait: Callable[[float], bool],
     secrets: list[str] | None = None,
+    run_immediately: bool = False,
+    before_run: Callable[[str], None] | None = None,
 ) -> int:
-    """Wait for the schedule, run once, and repeat until ``wait`` asks to stop.
+    """Run on the schedule until ``wait`` asks to stop.
 
+    When ``run_immediately`` is true, one cycle runs before the first wait.
     A successful result, a non-zero result, ``AscError``, and any other
-    exception are logged. None of them ends the loop. The data-directory lock
-    inside a normal run still rejects a second fetch while one is in progress.
-    This function returns 0 only after shutdown.
+    exception are logged. None of them ends the loop, including that first
+    cycle. A stop request during a cycle is noticed after the cycle returns,
+    and another cycle is not started. The data-directory lock inside a normal
+    run still rejects a second fetch while one is in progress. This function
+    returns 0 only after shutdown.
     """
 
     hidden = secrets or []
+
+    def cycle(trigger: str) -> None:
+        if before_run is not None:
+            try:
+                before_run(trigger)
+            except AscError as exc:
+                emit(f"未能写入 serve 运行记录，本次抓取仍会继续。{exc}", hidden, err=True)
+            except Exception:
+                emit("未能写入 serve 运行记录，本次抓取仍会继续。", hidden, err=True)
+                emit(redact(traceback.format_exc(), hidden), hidden, err=True)
+        try:
+            result = run_once()
+        except AscError as exc:
+            emit(f"本次运行失败，将等到下一个日程。{exc}", hidden, err=True)
+            return
+        except Exception:
+            emit("本次运行失败，将等到下一个日程。", hidden, err=True)
+            emit(redact(traceback.format_exc(), hidden), hidden, err=True)
+            return
+        emit(result.message, hidden, err=result.code != 0)
+        if result.code != 0:
+            emit("本次未成功，将等到下一个日程。", hidden, err=True)
+
+    if run_immediately:
+        cycle("startup")
+
     while True:
         now = clock()
         nxt = next_occurrence(schedule, now, tz)
@@ -1560,18 +1698,7 @@ def serve_loop(
         emit(f"下次运行：{nxt.isoformat(timespec='seconds')}", hidden)
         if wait(delay):
             return 0
-        try:
-            result = run_once()
-        except AscError as exc:
-            emit(f"本次运行失败，将等到下一个日程。{exc}", hidden, err=True)
-            continue
-        except Exception:
-            emit("本次运行失败，将等到下一个日程。", hidden, err=True)
-            emit(redact(traceback.format_exc(), hidden), hidden, err=True)
-            continue
-        emit(result.message, hidden, err=result.code != 0)
-        if result.code != 0:
-            emit("本次未成功，将等到下一个日程。", hidden, err=True)
+        cycle("schedule")
 
 
 def cmd_serve(
@@ -1593,13 +1720,20 @@ def cmd_serve(
 
     use_clock = clock or default_clock
     use_run = runner or default_run
-    # Reject a schedule that can never fire before sleeping.
+    # Reject a schedule that can never fire before sleeping or fetching.
     next_occurrence(schedule, use_clock(), tz)
+    plan = serve_start_plan(config.data_dir)
+    secrets = config.secret_values()
+    if plan.warning:
+        emit(plan.warning, secrets, err=True)
     emit(
         f"按日程运行：{schedule.expression}，时区 {tz.key}。"
-        "启动后先等待下一次，不会立刻抓取。"
+        f"{plan.notice}"
         "成功或失败都会继续等待；停止容器时，进行中的这一轮会做完再退出。"
     )
+
+    def before_run(trigger: str) -> None:
+        record_serve_run(config.data_dir, trigger, now=use_clock())
 
     def noop() -> None:
         return None
@@ -1615,7 +1749,9 @@ def cmd_serve(
             use_run,
             clock=use_clock,
             wait=use_wait,
-            secrets=config.secret_values(),
+            secrets=secrets,
+            run_immediately=plan.immediate,
+            before_run=before_run,
         )
     finally:
         restore()
@@ -1684,7 +1820,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--dry-run", action="store_true", help="只读取并打印汇总，不推送 Bark")
     commands.add_parser(
         "serve",
-        help="按 ASC_SCHEDULE 常驻运行；到点执行与 run 相同的抓取和推送",
+        help="按 ASC_SCHEDULE 常驻运行。该数据目录还没有 serve 运行记录时先抓取一次，之后到点再抓取",
     )
     commands.add_parser("test-notification", help="只发送一条 Bark 测试通知，不读取 Apple")
     return parser.parse_args(argv)

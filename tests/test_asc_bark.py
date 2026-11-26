@@ -10,8 +10,10 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from cryptography.hazmat.primitives import serialization
@@ -963,6 +965,7 @@ class AscBarkTests(unittest.TestCase):
         conflicted = asc_bark.cmd_init(self.config(bark=False), Session(conflict_handler), snapshot=False, sleeper=sleep)
         self.assertIn("已存在", conflicted.message)
         self.assertEqual(conflict["posts"], 1)
+        self.assertFalse((self.data / "serve.json").exists())
 
     def test_apple_retries_pagination_and_download_auth(self):
         delays, sleep = recording_sleeper()
@@ -1086,6 +1089,76 @@ class AscBarkTests(unittest.TestCase):
         self.assertNotIn(BARK_KEY, text)
         self.assertIn("[redacted-url]", text)
 
+    def test_one_shot_run_does_not_record_serve_and_restart_does_not_fetch(self):
+        catalog = ReadyCatalog()
+        catalog.no_requests = True
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            once = asc_bark.cmd_run(self.config(), Session(catalog.handler), dry_run=False)
+        self.assertEqual(once.code, 0, once.message)
+        self.assertIn("init", once.message)
+        self.assertTrue((self.data / "state.json").exists())
+        self.assertFalse((self.data / "serve.json").exists())
+
+        seen = {"before_fetch": False}
+
+        def handler(method, url, params, body, headers, timeout):
+            record = json.loads((self.data / "serve.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["runs"], 1)
+            self.assertEqual(record["first_trigger"], "startup")
+            self.assertEqual(record["last_trigger"], "startup")
+            seen["before_fetch"] = True
+            return catalog.handler(method, url, params, body, headers, timeout)
+
+        shanghai = ZoneInfo("Asia/Shanghai")
+        now = datetime(2026, 11, 26, 8, 0, tzinfo=shanghai)
+        session = Session(handler)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            served = asc_bark.cmd_serve(
+                self.config(),
+                session,
+                schedule=asc_bark.parse_schedule("0 9 * * *"),
+                tz=shanghai,
+                clock=lambda: now,
+                wait=lambda _delay: True,
+            )
+        self.assertEqual(served.code, 0, stderr.getvalue())
+        self.assertEqual(served.message, "已停止。")
+        self.assertTrue(seen["before_fetch"])
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], "GET")
+        self.assertIn("先抓取一次", stdout.getvalue())
+        self.assertIn("下次运行：2026-11-26T09:00:00+08:00", stdout.getvalue())
+        self.assertIn("还没有分析报表请求", stdout.getvalue())
+        self.assertNotIn(BARK_KEY, (self.data / "serve.json").read_text(encoding="utf-8"))
+        self.assertNotIn(self.pem, (self.data / "serve.json").read_text(encoding="utf-8"))
+        state = json.loads((self.data / "state.json").read_text(encoding="utf-8"))
+        self.assertNotIn("serve", state)
+        self.assertNotIn("startup", (self.data / "state.json").read_text(encoding="utf-8"))
+
+        restart = Session(handler)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            again = asc_bark.cmd_serve(
+                self.config(),
+                restart,
+                schedule=asc_bark.parse_schedule("09:00"),
+                tz=shanghai,
+                clock=lambda: now,
+                wait=lambda _delay: True,
+            )
+        self.assertEqual(again.code, 0, stderr.getvalue())
+        self.assertEqual(again.message, "已停止。")
+        self.assertEqual(restart.calls, [])
+        self.assertIn("不会立刻抓取", stdout.getvalue())
+        self.assertNotIn("先抓取一次", stdout.getvalue())
+        record = json.loads((self.data / "serve.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["runs"], 1)
+        self.assertEqual(record["first_trigger"], "startup")
+
     def test_corrupt_state_is_not_overwritten(self):
         path = self.data / "state.json"
         path.write_text("{", encoding="utf-8")
@@ -1125,6 +1198,7 @@ class AscBarkTests(unittest.TestCase):
         self.assertEqual(session.calls[0][3]["body"], "这是一条测试通知，不包含 App Store 数据。")
         self.assertNotIn(BARK_KEY, output.getvalue())
         self.assertNotIn("apple.com", session.calls[0][1])
+        self.assertFalse((self.data / "serve.json").exists())
 
     def test_concurrent_lock(self):
         lock_path = self.data / "asc-bark.lock"
