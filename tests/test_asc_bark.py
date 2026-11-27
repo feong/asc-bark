@@ -41,6 +41,27 @@ DISC_HEADER = (
     "Engagement Type\tDevice\tPlatform Version\tTerritory\tCounts\tUnique Counts"
 )
 
+# Titles from a live COMMERCE report list. The downloads Standard report is
+# "App Downloads Standard"; the other rows must not be selected.
+LIVE_COMMERCE_REPORTS = (
+    ("dl-detail", "App Downloads Detailed"),
+    ("dl-std", "App Downloads Standard"),
+    ("preorder-detail", "App Store Pre-Orders Detailed"),
+    ("preorder-std", "App Store Pre-Orders Standard"),
+    ("purchase-detail", "App Store Purchases Detailed"),
+    ("purchase-std", "App Store Purchases Standard"),
+    ("sub-event-detail", "App Store Subscription Event Report Detailed"),
+    ("sub-event-std", "App Store Subscription Event Report Standard"),
+    ("sub-state-detail", "App Store Subscription State Report Detailed"),
+    ("sub-state-std", "App Store Subscription State Report Standard"),
+)
+# Engagement's Standard title is unchanged. Neighbors must not be selected.
+LIVE_ENGAGEMENT_REPORTS = (
+    ("disc-detail", "App Store Discovery and Engagement Detailed"),
+    ("disc-std", "App Store Discovery and Engagement Standard"),
+    ("web-preview", "App Store Web Preview Engagement"),
+)
+
 
 def gzip_text(text: str) -> bytes:
     if not text.endswith("\n"):
@@ -217,6 +238,7 @@ class ReadyCatalog:
         self.pending_newest = False
         self.bark_codes = None
         self._bark_index = 0
+        self.named_reports = None
 
     def handler(self, method, url, params, body, headers, timeout):
         if method == "POST":
@@ -267,6 +289,12 @@ class ReadyCatalog:
             category = (parse_qs(urlparse(url).query).get("category") or [None])[0]
         if self.no_reports:
             return Response(200, page([]))
+        if self.named_reports is not None and category in self.named_reports:
+            data = [
+                resource("analyticsReports", rid, {"name": name, "category": category})
+                for rid, name in self.named_reports[category]
+            ]
+            return Response(200, page(data))
         if category == "COMMERCE":
             data = []
             if not self.only_detailed:
@@ -815,6 +843,202 @@ class AscBarkTests(unittest.TestCase):
             asc_bark.cmd_run(self.config(), Session(detailed.handler), dry_run=False, sleeper=recording_sleeper()[1])
         self.assertIn("没有改用 Detailed", str(caught.exception))
         self.assertIn("App Store Downloads Detailed", str(caught.exception))
+        self.assertIn("App Downloads Standard", str(caught.exception))
+        self.assertIn("App Store Downloads Standard", str(caught.exception))
+
+    def _spec(self, kind: str) -> dict:
+        for spec in asc_bark.REPORT_SPECS:
+            if spec["kind"] == kind:
+                return spec
+        raise AssertionError(kind)
+
+    def test_standard_report_names_accept_current_and_older_titles(self):
+        downloads = self._spec("downloads")
+        discovery = self._spec("discovery")
+        self.assertEqual(asc_bark.DOWNLOADS_REPORT_NAMES[0], "App Downloads Standard")
+        self.assertIn("App Store Downloads Standard", asc_bark.DOWNLOADS_REPORT_NAMES)
+        self.assertEqual(
+            asc_bark.DISCOVERY_REPORT_NAMES,
+            ("App Store Discovery and Engagement Standard",),
+        )
+        for name in (*asc_bark.DOWNLOADS_REPORT_NAMES, *asc_bark.DISCOVERY_REPORT_NAMES):
+            self.assertTrue(name.endswith(" Standard"), name)
+            self.assertNotIn("Detailed", name)
+
+        live = [
+            {"id": rid, "name": name, "category": "COMMERCE"}
+            for rid, name in LIVE_COMMERCE_REPORTS
+        ]
+        matched = asc_bark._matching_reports(live, downloads)
+        self.assertEqual([(item["id"], item["name"]) for item in matched], [
+            ("dl-std", "App Downloads Standard"),
+        ])
+        self.assertEqual(asc_bark._matching_reports(live, discovery), [])
+
+        spaced = [{
+            "id": "spaced",
+            "name": "  APP   DOWNLOADS   standard  ",
+            "category": "COMMERCE",
+        }]
+        self.assertEqual(asc_bark._matching_reports(spaced, downloads)[0]["id"], "spaced")
+        legacy = [{
+            "id": "legacy",
+            "name": "App Store Downloads Standard",
+            "category": "COMMERCE",
+        }]
+        self.assertEqual(asc_bark._matching_reports(legacy, downloads)[0]["id"], "legacy")
+        self.assertEqual(
+            [item["id"] for item in asc_bark._matching_reports(live + legacy, downloads)],
+            ["dl-std", "legacy"],
+        )
+        wrong_category = [{
+            "id": "elsewhere",
+            "name": "App Downloads Standard",
+            "category": "APP_STORE_ENGAGEMENT",
+        }]
+        self.assertEqual(asc_bark._matching_reports(wrong_category, downloads), [])
+        self.assertEqual(asc_bark._matching_reports(wrong_category, discovery), [])
+
+        engagement = [
+            {
+                "id": "disc-detail",
+                "name": "App Store Discovery and Engagement Detailed",
+                "category": "APP_STORE_ENGAGEMENT",
+            },
+            {
+                "id": "disc-std",
+                "name": "  app store   discovery and engagement standard ",
+                "category": "APP_STORE_ENGAGEMENT",
+            },
+            {
+                "id": "web",
+                "name": "App Store Web Preview Engagement",
+                "category": "APP_STORE_ENGAGEMENT",
+            },
+            {
+                "id": "bare",
+                "name": "App Store Discovery and Engagement",
+                "category": "APP_STORE_ENGAGEMENT",
+            },
+        ]
+        self.assertEqual(
+            [item["id"] for item in asc_bark._matching_reports(engagement, discovery)],
+            ["disc-std"],
+        )
+        self.assertEqual(asc_bark._matching_reports(engagement, downloads), [])
+        for name in (
+            "App Downloads Detailed",
+            "App Store Downloads Detailed",
+            "App Store Purchases Standard",
+            "App Store Pre-Orders Standard",
+            "App Downloads",
+            "App Store Subscription Event Report Standard",
+            "App Store Subscription State Report Standard",
+        ):
+            self.assertEqual(
+                asc_bark._matching_reports(
+                    [{"id": "x", "name": name, "category": "COMMERCE"}],
+                    downloads,
+                ),
+                [],
+                name,
+            )
+
+    def test_live_commerce_list_selects_app_downloads_standard(self):
+        catalog = ReadyCatalog()
+        catalog.named_reports = {
+            "COMMERCE": LIVE_COMMERCE_REPORTS,
+            "APP_STORE_ENGAGEMENT": LIVE_ENGAGEMENT_REPORTS,
+        }
+        session = Session(catalog.handler)
+        result = asc_bark.cmd_run(self.config(), session, dry_run=True, sleeper=recording_sleeper()[1])
+        self.assertEqual(result.code, 0, result.message)
+        self.assertNotIn("未找到报表", result.message)
+        self.assertNotIn("没有改用 Detailed", result.message)
+        self.assertIn("首次下载 12（事件次数）", result.message)
+        self.assertIn("重新下载 3（事件次数）", result.message)
+        self.assertIn("展示次数 25（事件次数，不含浏览）", result.message)
+        self.assertIn("产品页浏览 9（事件次数）", result.message)
+        self.assertNotIn("1000", result.message)
+        self.assertEqual(catalog.posts, [])
+        self.assertFalse(any(call[0] == "POST" for call in session.calls))
+        self.assertCountEqual(self._instance_report_ids(session), ["dl-std", "disc-std"])
+        downloaded = self._file_gets(session)
+        self.assertIn("dl-daily", downloaded)
+        self.assertNotIn("dl-detail", downloaded)
+        self.assertNotIn("disc-detail", downloaded)
+        for rejected in (
+            "preorder-std",
+            "preorder-detail",
+            "purchase-std",
+            "purchase-detail",
+            "sub-event-std",
+            "sub-event-detail",
+            "sub-state-std",
+            "sub-state-detail",
+            "web-preview",
+        ):
+            self.assertNotIn(rejected, downloaded)
+            self.assertNotIn(rejected, self._instance_report_ids(session))
+
+        without_standard = tuple(
+            item for item in LIVE_COMMERCE_REPORTS if item[1] != "App Downloads Standard"
+        )
+        refused = ReadyCatalog()
+        refused.named_reports = {
+            "COMMERCE": without_standard,
+            "APP_STORE_ENGAGEMENT": LIVE_ENGAGEMENT_REPORTS,
+        }
+        refused_session = Session(refused.handler)
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_run(
+                self.config(),
+                refused_session,
+                dry_run=True,
+                sleeper=recording_sleeper()[1],
+            )
+        message = str(caught.exception)
+        self.assertIn("未找到报表“App Downloads Standard”（COMMERCE）", message)
+        self.assertIn("也接受旧名“App Store Downloads Standard”", message)
+        self.assertIn("没有改用 Detailed", message)
+        for _rid, name in without_standard:
+            self.assertIn(name, message)
+        self.assertNotIn("已推送", message)
+        self.assertEqual(self._file_gets(refused_session), [])
+        self.assertNotIn("dl-detail", self._instance_report_ids(refused_session))
+        self.assertEqual(refused.posts, [])
+
+        engagement_only_detailed = ReadyCatalog()
+        engagement_only_detailed.named_reports = {
+            "COMMERCE": LIVE_COMMERCE_REPORTS,
+            "APP_STORE_ENGAGEMENT": (
+                ("disc-detail", "App Store Discovery and Engagement Detailed"),
+                ("web-preview", "App Store Web Preview Engagement"),
+            ),
+        }
+        engagement_session = Session(engagement_only_detailed.handler)
+        with self.assertRaises(asc_bark.AscError) as caught:
+            asc_bark.cmd_run(
+                self.config(),
+                engagement_session,
+                dry_run=True,
+                sleeper=recording_sleeper()[1],
+            )
+        message = str(caught.exception)
+        self.assertIn(
+            "未找到报表“App Store Discovery and Engagement Standard”（APP_STORE_ENGAGEMENT）",
+            message,
+        )
+        self.assertIn("App Store Discovery and Engagement Detailed", message)
+        self.assertIn("App Store Web Preview Engagement", message)
+        self.assertIn("没有改用 Detailed", message)
+        self.assertNotIn("未找到报表“App Downloads Standard”", message)
+        self.assertEqual(self._file_gets(engagement_session), [])
+        engagement_instances = self._instance_report_ids(engagement_session)
+        self.assertIn("dl-std", engagement_instances)
+        self.assertNotIn("disc-detail", engagement_instances)
+        self.assertNotIn("web-preview", engagement_instances)
+        self.assertEqual(engagement_only_detailed.posts, [])
 
     def test_bark_failure_is_not_marked_and_retries(self):
         failed = ReadyCatalog()
@@ -1611,6 +1835,14 @@ class AscBarkTests(unittest.TestCase):
         for method, url, _params, _body, _headers, _timeout in session.calls:
             if method == "GET" and url.startswith(FILES):
                 found.append(Path(urlparse(url).path).name.replace(".gz", ""))
+        return found
+
+    def _instance_report_ids(self, session: Session) -> list[str]:
+        found = []
+        for method, url, _params, _body, _headers, _timeout in session.calls:
+            path = urlparse(url).path
+            if method == "GET" and path.rstrip("/").endswith("/instances"):
+                found.append(path.strip("/").split("/")[-2])
         return found
 
     def _assert_downloads_are_anonymous(self, session: Session) -> None:

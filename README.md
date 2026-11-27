@@ -24,11 +24,11 @@ git clone https://github.com/feong/asc-bark.git
 
 ## 指标
 
-只用两份 **Standard**、**DAILY** 报表。`name` 按苹果文档的写法，是报表标题加 `Standard` 或 `Detailed` 后缀：
+只用两份 **Standard**、**DAILY** 报表。`name` 是报表标题加 `Standard` 或 `Detailed` 后缀。下载报表当前的标题是 `App Downloads`；较早的响应里仍可能是 `App Store Downloads`，这两种 Standard 名称都会采用。发现与互动报表的标题仍是 `App Store Discovery and Engagement`。文档页标题可能仍写作 App Store Downloads，接口返回的 `name` 以这里列出的为准。
 
 | 报表 `name` | `category` | 用途 |
 | --- | --- | --- |
-| `App Store Downloads Standard` | `COMMERCE` | 下载 |
+| `App Downloads Standard`（也接受 `App Store Downloads Standard`） | `COMMERCE` | 下载 |
 | `App Store Discovery and Engagement Standard` | `APP_STORE_ENGAGEMENT` | 展示、产品页浏览 |
 
 Detailed 是另一套隐私处理，不是同一批事件的补充行，因此不会并入，也不会在找不到 Standard 时拿来代替。周报和月报的 `Date` 是该周或该月的第一天，不会当成某一个事件日。

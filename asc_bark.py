@@ -16,11 +16,13 @@ and it does not scrape the App Store Connect website.
 
 Reports, both standard and daily granularity only:
 
-- ``App Store Downloads Standard`` (``COMMERCE``)
+- ``App Downloads Standard`` (``COMMERCE``). Older responses may still say
+  ``App Store Downloads Standard``; both names are accepted.
 - ``App Store Discovery and Engagement Standard`` (``APP_STORE_ENGAGEMENT``)
 
 Apple's ``name`` is the report title plus a ``Standard`` or ``Detailed``
-suffix. Detailed reports are a different privacy treatment, not an extra
+suffix. The downloads title in current responses is ``App Downloads``.
+Detailed reports are a different privacy treatment, not an extra
 slice of the same events, so they are never added in.
 
 Within one report instance every segment is a partition of that instance.
@@ -58,8 +60,13 @@ import requests
 
 API_BASE = "https://api.appstoreconnect.apple.com"
 DEFAULT_BARK_SERVER = "https://api.day.app"
-DOWNLOADS_REPORT = "App Store Downloads Standard"
-DISCOVERY_REPORT = "App Store Discovery and Engagement Standard"
+# Current Analytics Reports titles, then older titles that still appear.
+# The Standard or Detailed suffix is part of the name. Detailed is not an alias.
+DOWNLOADS_REPORT_NAMES = (
+    "App Downloads Standard",
+    "App Store Downloads Standard",
+)
+DISCOVERY_REPORT_NAMES = ("App Store Discovery and Engagement Standard",)
 DOWNLOADS_CATEGORY = "COMMERCE"
 DISCOVERY_CATEGORY = "APP_STORE_ENGAGEMENT"
 USER_AGENT = "asc-bark"
@@ -90,12 +97,12 @@ REPORT_SPECS = (
     {
         "kind": "downloads",
         "category": DOWNLOADS_CATEGORY,
-        "name": DOWNLOADS_REPORT,
+        "names": DOWNLOADS_REPORT_NAMES,
     },
     {
         "kind": "discovery",
         "category": DISCOVERY_CATEGORY,
-        "name": DISCOVERY_REPORT,
+        "names": DISCOVERY_REPORT_NAMES,
     },
 )
 
@@ -1370,13 +1377,43 @@ def _init_requests(
         return lines
 
 
-def _matching_reports(reports: list[dict[str, str]], spec: dict[str, str]) -> list[dict[str, str]]:
-    expected = canon_name(spec["name"])
+def _report_names(spec: Mapping[str, object]) -> tuple[str, ...]:
+    names = spec["names"]
+    if isinstance(names, tuple) and names and all(isinstance(name, str) and name for name in names):
+        return names
+    raise AscError("报表名称配置无法识别。")
+
+
+def _matching_reports(
+    reports: list[dict[str, str]],
+    spec: Mapping[str, object],
+) -> list[dict[str, str]]:
+    """Return Standard reports whose name is one of the accepted titles.
+
+    Comparison ignores case and repeated whitespace. A Detailed report is
+    never a match, including when its title is otherwise the same.
+    """
+
+    expected = {canon_name(name) for name in _report_names(spec)}
+    category = spec["category"]
     return [
         report
         for report in reports
-        if canon_name(report["name"]) == expected and report["category"] == spec["category"]
+        if canon_name(report["name"]) in expected and report["category"] == category
     ]
+
+
+def _missing_report_message(spec: Mapping[str, object], reports: list[dict[str, str]]) -> str:
+    names = _report_names(spec)
+    alias = ""
+    if len(names) > 1:
+        alias = "也接受旧名" + "、".join(f"“{name}”" for name in names[1:]) + "。"
+    return (
+        f"未找到报表“{names[0]}”（{spec['category']}）。"
+        f"{alias}"
+        f"该分类返回的报表：{_names(reports)}。"
+        "没有改用 Detailed 报表。"
+    )
 
 
 def cmd_run(
@@ -1514,11 +1551,7 @@ def _run_locked(
     for spec in REPORT_SPECS:
         reports = category_reports[spec["kind"]]
         if reports and not found[spec["kind"]] and not _matching_reports(reports, spec):
-            raise AscError(
-                f"未找到报表“{spec['name']}”（{spec['category']}）。"
-                f"该分类返回的报表：{_names(reports)}。"
-                "没有改用 Detailed 报表。"
-            )
+            raise AscError(_missing_report_message(spec, reports))
     if any(not category_reports[spec["kind"]] for spec in REPORT_SPECS):
         return Result(0, "报表请求已存在，但标准日报还没有列出。首次请求后通常需要 1–2 天。本次不推送。")
     if any(not found[spec["kind"]] for spec in REPORT_SPECS):
